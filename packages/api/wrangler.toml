@@ -1,0 +1,30 @@
+name = "oob-api"
+main = "src/index.ts"
+compatibility_date = "2024-11-15"
+
+[vars]
+# Rate limiting defaults (per minute)
+RATE_LIMIT_PUBLIC_READS = "60"
+RATE_LIMIT_PUBLIC_WRITES = "10"
+RATE_LIMIT_REGISTERED_READS = "300"
+RATE_LIMIT_REGISTERED_WRITES = "60"
+
+# Secrets (set via wrangler secret put):
+# - DATABASE_URL (Neon Postgres connection string)
+# - API_ADMIN_TOKEN (for admin endpoints, optional)
+
+# KV for rate limiting counters
+# Create with: wrangler kv:namespace create "OOB_RATE_LIMIT"
+[[kv_namespaces]]
+binding = "OOB_RATE_LIMIT"
+id = "d928a40abd4645d3b672639a45382519"
+
+# Durable Objects for WebSocket streams
+[durable_objects]
+bindings = [
+  { name = "ORDER_STREAM", class_name = "OrderStreamDO" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["OrderStreamDO"]
