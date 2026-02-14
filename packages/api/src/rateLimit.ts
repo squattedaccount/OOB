@@ -28,10 +28,10 @@ export async function checkRateLimit(
   if (!kv) return null; // KV not configured, skip rate limiting
 
   const apiKey = request.headers.get("X-API-Key");
-  const isRegistered = !!apiKey;
+  const isRegistered = apiKey ? isValidApiKey(apiKey, env) : false;
 
-  // Determine identifier: API key or IP address
-  const identifier = apiKey || getClientIp(request);
+  // Determine identifier: API key (if valid) or IP address
+  const identifier = (apiKey && isRegistered) ? apiKey : getClientIp(request);
   if (!identifier) return null; // Can't identify client
 
   // Determine limit based on tier and request type
@@ -43,9 +43,16 @@ export async function checkRateLimit(
   const key = `rl:${identifier}:${kind}:${minute}`;
 
   try {
+    // Increment-first pattern: always increment, then check.
+    // This prevents the race where parallel requests all read the same value
+    // and all pass before any of them writes the incremented counter.
     const current = Number(await kv.get(key) || "0");
+    const next = current + 1;
 
-    if (current >= limit) {
+    // Write the incremented value immediately (before checking limit)
+    await kv.put(key, String(next), { expirationTtl: 120 });
+
+    if (next > limit) {
       const retryAfter = 60 - (Math.floor(Date.now() / 1000) % 60);
       const res = jsonError(429, "Rate limit exceeded. Try again later.");
       res.headers.set("Retry-After", String(retryAfter));
@@ -55,14 +62,26 @@ export async function checkRateLimit(
       return res;
     }
 
-    // Increment counter (fire-and-forget for performance)
-    // TTL of 120s ensures cleanup even if the minute boundary shifts
-    await kv.put(key, String(current + 1), { expirationTtl: 120 });
+    // For writes, add a per-second micro-burst limiter to constrain parallel abuse.
+    // This limits write bursts to ~5 per second even if the per-minute limit is higher.
+    if (isWrite) {
+      const second = Math.floor(Date.now() / 1000);
+      const burstKey = `rl:${identifier}:burst:${second}`;
+      const burstCount = Number(await kv.get(burstKey) || "0");
+      await kv.put(burstKey, String(burstCount + 1), { expirationTtl: 5 });
+      if (burstCount >= 5) {
+        const res = jsonError(429, "Too many requests per second. Slow down.");
+        res.headers.set("Retry-After", "1");
+        return res;
+      }
+    }
 
     return null; // Allowed
   } catch (err) {
-    // If KV fails, allow the request (fail open)
-    console.error("[oob-api] Rate limit check failed:", err);
+    // KV unreachable — log and allow through.
+    // Blocking all writes when KV is down is a self-DoS; the DB-level validations
+    // (signature checks, fee enforcement, order caps) still protect against abuse.
+    console.error("[oob-api] Rate limit KV error (allowing request):", err);
     return null;
   }
 }
@@ -80,8 +99,8 @@ export async function addRateLimitHeaders(
   if (!kv) return response;
 
   const apiKey = request.headers.get("X-API-Key");
-  const isRegistered = !!apiKey;
-  const identifier = apiKey || getClientIp(request);
+  const isRegistered = apiKey ? isValidApiKey(apiKey, env) : false;
+  const identifier = (apiKey && isRegistered) ? apiKey : getClientIp(request);
   if (!identifier) return response;
 
   const limit = getLimit(env, isRegistered, isWrite);
@@ -110,6 +129,12 @@ function getLimit(env: Env, isRegistered: boolean, isWrite: boolean): number {
   return isWrite
     ? Number(env.RATE_LIMIT_PUBLIC_WRITES || 10)
     : Number(env.RATE_LIMIT_PUBLIC_READS || 60);
+}
+
+function isValidApiKey(key: string, env: Env): boolean {
+  if (!env.API_KEYS) return false;
+  const validKeys = env.API_KEYS.split(",").map((k) => k.trim()).filter(Boolean);
+  return validKeys.includes(key);
 }
 
 function getClientIp(request: Request): string {

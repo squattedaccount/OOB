@@ -1,0 +1,22 @@
+name = "oob-indexer"
+main = "src/index.ts"
+compatibility_date = "2024-11-15"
+
+[vars]
+# Max active orders to check for staleness per cron run
+STALE_CHECK_LIMIT = "50"
+
+# RPC URLs per chain (set via wrangler secret put for production)
+# - RPC_URL_ETHEREUM
+# - RPC_URL_BASE
+# - RPC_URL_HYPERLIQUID
+# - RPC_URL_RONIN
+# - RPC_URL_ABSTRACT
+
+# Secrets (set via wrangler secret put):
+# - DATABASE_URL (same Neon Postgres as oob-api)
+# - WEBHOOK_SECRET (shared secret for webhook verification)
+# - ALCHEMY_SIGNING_KEY (for HMAC-SHA256 webhook verification)
+
+[triggers]
+crons = ["*/5 * * * *"]  # every 5 minutes: expire orders + stale detection

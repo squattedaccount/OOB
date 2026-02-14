@@ -5,6 +5,7 @@
 
 import type {
   OobConfig,
+  ProtocolConfig,
   GetOrdersParams,
   GetBestOrderParams,
   OrdersResponse,
@@ -20,10 +21,32 @@ export class ApiClient {
   private chainId: number;
   private apiKey?: string;
 
+  // Protocol config cache (TTL: 5 minutes)
+  private _protocolConfig: ProtocolConfig | null = null;
+  private _protocolConfigFetchedAt = 0;
+  private static PROTOCOL_CONFIG_TTL = 5 * 60 * 1000; // 5 min
+
   constructor(config: OobConfig) {
     this.baseUrl = (config.apiUrl || DEFAULT_API_URL).replace(/\/$/, "");
     this.chainId = config.chainId;
     this.apiKey = config.apiKey;
+  }
+
+  // ─── Protocol Config ──────────────────────────────────────────────────
+
+  /**
+   * Fetch the current protocol fee config from the API.
+   * Cached for 5 minutes to avoid excessive requests.
+   */
+  async getProtocolConfig(): Promise<ProtocolConfig> {
+    const now = Date.now();
+    if (this._protocolConfig && (now - this._protocolConfigFetchedAt) < ApiClient.PROTOCOL_CONFIG_TTL) {
+      return this._protocolConfig;
+    }
+    const config = await this.get<ProtocolConfig>("/v1/config");
+    this._protocolConfig = config;
+    this._protocolConfigFetchedAt = now;
+    return config;
   }
 
   // ─── Read Methods ───────────────────────────────────────────────────────
@@ -89,11 +112,11 @@ export class ApiClient {
 
   async cancelOrder(
     orderHash: string,
-    txHash?: string,
+    signature: string,
   ): Promise<{ orderHash: string; status: string }> {
     return this.del<{ orderHash: string; status: string }>(
       `/v1/orders/${orderHash}`,
-      txHash ? { txHash } : undefined,
+      { signature },
     );
   }
 

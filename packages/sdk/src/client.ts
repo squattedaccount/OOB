@@ -38,6 +38,9 @@ export class OpenOrderBook {
   private publicClient?: PublicClient;
 
   constructor(config: OobConfig) {
+    if ((config.feeBps ?? DEFAULT_FEE_BPS) > 0 && !(config.feeRecipient ?? DEFAULT_FEE_RECIPIENT)) {
+      throw new Error("Invalid config: feeRecipient is required when feeBps > 0");
+    }
     this.config = {
       chainId: config.chainId,
       apiUrl: config.apiUrl ?? DEFAULT_API_URL,
@@ -199,7 +202,10 @@ export class OpenOrderBook {
       );
     }
 
-    const { order, signature } = await this.seaport.createListing(params, wallet, pub);
+    // Fetch current protocol fee from API (cached 5 min)
+    const protocolConfig = await this.api.getProtocolConfig();
+
+    const { order, signature } = await this.seaport.createListing(params, wallet, pub, protocolConfig);
     return this.api.submitOrder(order, signature);
   }
 
@@ -242,7 +248,10 @@ export class OpenOrderBook {
       );
     }
 
-    const { order, signature } = await this.seaport.createOffer(params, wallet, pub);
+    // Fetch current protocol fee from API (cached 5 min)
+    const protocolConfig = await this.api.getProtocolConfig();
+
+    const { order, signature } = await this.seaport.createOffer(params, wallet, pub, protocolConfig);
     return this.api.submitOrder(order, signature);
   }
 
@@ -267,22 +276,112 @@ export class OpenOrderBook {
     if (!order) throw new Error(`Order ${orderHash} not found`);
     if (order.status !== "active") throw new Error(`Order is ${order.status}, not active`);
 
+    const filler = wallet.account!.address as Address;
+
+    if (order.orderType === "offer") {
+      // Seller accepting an offer: needs NFT approval + ERC20 approval for fees.
+      // Seaport pulls the NFT from the seller and also pulls ERC20 fee payments
+      // from the seller via transferFrom (even though the seller receives ERC20
+      // from the offerer in the same tx, allowance is still required).
+
+      // 1. Check NFT approval
+      const nftApproved = await this.seaport.isApprovedForAll(
+        order.nftContract as Address,
+        filler,
+        pub,
+      );
+      if (!nftApproved) {
+        throw new NeedsApprovalError(
+          "collection",
+          order.nftContract,
+          "NFT collection is not approved for Seaport. Call oob.approveCollection() first.",
+        );
+      }
+
+      // 2. Check ERC20 approval for fee consideration items the seller must pay
+      const considerationItems = order.orderJson.consideration || [];
+      let totalErc20FeesWei = 0n;
+      let feeToken = "";
+      for (const item of considerationItems) {
+        if (Number(item.itemType) === 1) { // ERC20
+          const recipient = (item.recipient || "").toLowerCase();
+          if (recipient !== filler.toLowerCase()) {
+            totalErc20FeesWei += BigInt(item.startAmount);
+            if (!feeToken) feeToken = item.token;
+          }
+        }
+      }
+
+      if (totalErc20FeesWei > 0n && feeToken) {
+        const readiness = await this.seaport.checkErc20Readiness(
+          feeToken as Address,
+          filler,
+          totalErc20FeesWei,
+          pub,
+        );
+        if (!readiness.hasAllowance) {
+          throw new NeedsApprovalError(
+            "erc20",
+            feeToken,
+            `ERC20 approval needed to pay fees when accepting offer. The seller must approve Seaport to spend ${feeToken}. Call oob.approveErc20('${feeToken}') first.`,
+          );
+        }
+      }
+    } else {
+      // Buyer filling a listing: check they can pay
+      const isNative = order.currency === "0x0000000000000000000000000000000000000000";
+      if (!isNative) {
+        const readiness = await this.seaport.checkErc20Readiness(
+          order.currency as Address,
+          filler,
+          BigInt(order.priceWei),
+          pub,
+        );
+        if (!readiness.hasBalance) {
+          throw new InsufficientBalanceError(
+            order.currency,
+            readiness.balance,
+            BigInt(order.priceWei),
+          );
+        }
+        if (!readiness.hasAllowance) {
+          throw new NeedsApprovalError(
+            "erc20",
+            order.currency,
+            "ERC20 token is not approved for Seaport. Call oob.approveErc20() first.",
+          );
+        }
+      }
+    }
+
     return this.seaport.fillOrder(order, wallet, pub, params);
   }
 
   /**
-   * Cancel an order on-chain and notify the API.
+   * Cancel an order: sign cancel message for API + cancel on-chain.
+   * The API is notified immediately via signature so the order is marked
+   * cancelled off-chain without waiting for the indexer webhook.
    */
   async cancelOrder(orderHash: string): Promise<{ txHash: Hex; apiStatus: string }> {
     const { wallet } = this.requireWallet();
+    const account = wallet.account;
+    if (!account) throw new Error("WalletClient must have an account");
 
     const order = await this.getOrder(orderHash);
     if (!order) throw new Error(`Order ${orderHash} not found`);
 
-    const txHash = await this.seaport.cancelOrders([order.orderJson], wallet);
+    // 1. Sign cancel message for the API (EIP-191 personal_sign)
+    const cancelMessage = `cancel:${orderHash}`;
+    const cancelSig = await wallet.signMessage({
+      message: cancelMessage,
+      account,
+    });
 
-    // Notify API
-    const apiResult = await this.api.cancelOrder(orderHash, txHash);
+    // 2. Notify API immediately (off-chain cancel)
+    const apiResult = await this.api.cancelOrder(orderHash, cancelSig);
+
+    // 3. Cancel on-chain via Seaport (so order can't be filled even if API is down)
+    const txHash = await this.seaport.cancelOrders([order.orderJson], wallet);
 
     return { txHash, apiStatus: apiResult.status };
   }

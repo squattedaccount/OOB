@@ -31,6 +31,7 @@ export { SeaportClient } from "./seaport.js";
 // Types
 export type {
   OobConfig,
+  ProtocolConfig,
   OobOrder,
   OrderStatus,
   SeaportOrderComponents,

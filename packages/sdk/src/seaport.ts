@@ -26,6 +26,7 @@ import {
   type SeaportOfferItem,
   type SeaportConsiderationItem,
   type OobConfig,
+  type ProtocolConfig,
   type CreateListingParams,
   type CreateOfferParams,
   type FillOrderParams,
@@ -110,13 +111,16 @@ const SEAPORT_ORDER_TYPE = {
 
 export class SeaportClient {
   private chainId: number;
-  private feeBps: number;
-  private feeRecipient: Address;
+  private marketplaceFeeBps: number;
+  private marketplaceFeeRecipient: string;
 
   constructor(config: OobConfig) {
+    if ((config.feeBps ?? DEFAULT_FEE_BPS) > 0 && !(config.feeRecipient ?? DEFAULT_FEE_RECIPIENT)) {
+      throw new Error("Invalid config: feeRecipient is required when feeBps > 0");
+    }
     this.chainId = config.chainId;
-    this.feeBps = config.feeBps ?? DEFAULT_FEE_BPS;
-    this.feeRecipient = getAddress(config.feeRecipient ?? DEFAULT_FEE_RECIPIENT);
+    this.marketplaceFeeBps = config.feeBps ?? DEFAULT_FEE_BPS;
+    this.marketplaceFeeRecipient = config.feeRecipient ?? DEFAULT_FEE_RECIPIENT;
   }
 
   // ─── Order Construction ─────────────────────────────────────────────────
@@ -124,11 +128,17 @@ export class SeaportClient {
   /**
    * Build and sign a listing order (seller offers NFT, wants payment).
    * Returns the signed order components + signature.
+   *
+   * The order includes up to 3 fee consideration items:
+   * 1. Protocol fee (OOB) — fetched from API, non-negotiable
+   * 2. Marketplace fee — configured by the marketplace using the SDK
+   * 3. Royalty — optional, specified per-listing
    */
   async createListing(
     params: CreateListingParams,
     walletClient: WalletClient,
     publicClient: PublicClient,
+    protocolConfig?: ProtocolConfig,
   ): Promise<{ order: SeaportOrderComponents; signature: Hex }> {
     const account = walletClient.account;
     if (!account) throw new Error("WalletClient must have an account");
@@ -139,9 +149,20 @@ export class SeaportClient {
     const isNative = currency === "0x0000000000000000000000000000000000000000";
     const currencyItemType = isNative ? ItemType.NATIVE : ItemType.ERC20;
 
-    // Calculate fee split
-    const feeAmount = (priceWei * BigInt(this.feeBps)) / 10000n;
-    const sellerProceeds = priceWei - feeAmount;
+    // Calculate protocol fee (from API config)
+    const protocolFeeBps = protocolConfig?.protocolFeeBps ?? 0;
+    const protocolFeeRecipient = protocolConfig?.protocolFeeRecipient ?? "";
+    const protocolFeeAmount = protocolFeeBps > 0 && protocolFeeRecipient
+      ? (priceWei * BigInt(protocolFeeBps)) / 10000n
+      : 0n;
+
+    // Calculate marketplace fee (from SDK config)
+    const marketplaceFeeAmount = this.marketplaceFeeBps > 0 && this.marketplaceFeeRecipient
+      ? (priceWei * BigInt(this.marketplaceFeeBps)) / 10000n
+      : 0n;
+
+    const totalFees = protocolFeeAmount + marketplaceFeeAmount;
+    const sellerProceeds = priceWei - totalFees;
 
     // Build consideration items
     const consideration: SeaportConsiderationItem[] = [
@@ -155,15 +176,27 @@ export class SeaportClient {
       },
     ];
 
-    // Add marketplace fee
-    if (feeAmount > 0n) {
+    // Add protocol fee (OOB)
+    if (protocolFeeAmount > 0n && protocolFeeRecipient) {
       consideration.push({
         itemType: currencyItemType,
         token: currency,
         identifierOrCriteria: "0",
-        startAmount: feeAmount.toString(),
-        endAmount: feeAmount.toString(),
-        recipient: this.feeRecipient,
+        startAmount: protocolFeeAmount.toString(),
+        endAmount: protocolFeeAmount.toString(),
+        recipient: getAddress(protocolFeeRecipient),
+      });
+    }
+
+    // Add marketplace fee
+    if (marketplaceFeeAmount > 0n && this.marketplaceFeeRecipient) {
+      consideration.push({
+        itemType: currencyItemType,
+        token: currency,
+        identifierOrCriteria: "0",
+        startAmount: marketplaceFeeAmount.toString(),
+        endAmount: marketplaceFeeAmount.toString(),
+        recipient: getAddress(this.marketplaceFeeRecipient),
       });
     }
 
@@ -230,11 +263,13 @@ export class SeaportClient {
 
   /**
    * Build and sign an offer order (buyer offers ERC20, wants NFT).
+   * Fees are added as consideration items (paid from the offer amount by the seller).
    */
   async createOffer(
     params: CreateOfferParams,
     walletClient: WalletClient,
     publicClient: PublicClient,
+    protocolConfig?: ProtocolConfig,
   ): Promise<{ order: SeaportOrderComponents; signature: Hex }> {
     const account = walletClient.account;
     if (!account) throw new Error("WalletClient must have an account");
@@ -243,8 +278,17 @@ export class SeaportClient {
     const amountWei = BigInt(params.amountWei);
     const currency = getAddress(params.currency);
 
-    // Fee is deducted from what the seller receives
-    const feeAmount = (amountWei * BigInt(this.feeBps)) / 10000n;
+    // Calculate protocol fee (from API config)
+    const protocolFeeBps = protocolConfig?.protocolFeeBps ?? 0;
+    const protocolFeeRecipient = protocolConfig?.protocolFeeRecipient ?? "";
+    const protocolFeeAmount = protocolFeeBps > 0 && protocolFeeRecipient
+      ? (amountWei * BigInt(protocolFeeBps)) / 10000n
+      : 0n;
+
+    // Calculate marketplace fee (from SDK config)
+    const marketplaceFeeAmount = this.marketplaceFeeBps > 0 && this.marketplaceFeeRecipient
+      ? (amountWei * BigInt(this.marketplaceFeeBps)) / 10000n
+      : 0n;
 
     // Determine if this is a specific token offer or collection offer
     const isCollectionOffer = !params.tokenId;
@@ -263,15 +307,27 @@ export class SeaportClient {
       },
     ];
 
-    // Marketplace fee (paid from the offer amount)
-    if (feeAmount > 0n) {
+    // Protocol fee (OOB — paid from the offer amount by the seller)
+    if (protocolFeeAmount > 0n && protocolFeeRecipient) {
       consideration.push({
         itemType: ItemType.ERC20,
         token: currency,
         identifierOrCriteria: "0",
-        startAmount: feeAmount.toString(),
-        endAmount: feeAmount.toString(),
-        recipient: this.feeRecipient,
+        startAmount: protocolFeeAmount.toString(),
+        endAmount: protocolFeeAmount.toString(),
+        recipient: getAddress(protocolFeeRecipient),
+      });
+    }
+
+    // Marketplace fee
+    if (marketplaceFeeAmount > 0n && this.marketplaceFeeRecipient) {
+      consideration.push({
+        itemType: ItemType.ERC20,
+        token: currency,
+        identifierOrCriteria: "0",
+        startAmount: marketplaceFeeAmount.toString(),
+        endAmount: marketplaceFeeAmount.toString(),
+        recipient: getAddress(this.marketplaceFeeRecipient),
       });
     }
 

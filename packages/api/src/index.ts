@@ -10,8 +10,11 @@
  *   GET    /v1/orders/best-offer         — Highest active offer
  *   GET    /v1/orders/:hash              — Get single order by hash
  *   POST   /v1/orders                    — Submit a signed order
+ *   POST   /v1/orders/batch             — Batch submit up to 20 orders
  *   DELETE  /v1/orders/:hash             — Cancel an order
+ *   DELETE  /v1/orders/batch             — Batch cancel up to 20 orders
  *   GET    /v1/collections/:addr/stats   — Collection floor, offer count, etc.
+ *   GET    /v1/config                    — Protocol fee config (for SDK)
  *   GET    /health                       — Health check
  */
 
@@ -25,7 +28,10 @@ import {
   handleBestOffer,
   handleSubmitOrder,
   handleCancelOrder,
+  handleBatchSubmitOrders,
+  handleBatchCancelOrders,
   handleCollectionStats,
+  handleGetActivity,
 } from "./routes/orders.js";
 
 export { OrderStreamDO } from "./stream.js";
@@ -111,6 +117,16 @@ async function route(
   // ─── /v1/orders ─────────────────────────────────────────────────────
 
   if (resource === "orders") {
+    // POST /v1/orders/batch (batch submit)
+    if (segments[2] === "batch" && method === "POST") {
+      return handleBatchSubmitOrders(ctx);
+    }
+
+    // DELETE /v1/orders/batch (batch cancel)
+    if (segments[2] === "batch" && method === "DELETE") {
+      return handleBatchCancelOrders(ctx);
+    }
+
     // GET /v1/orders/best-listing
     if (segments[2] === "best-listing" && method === "GET") {
       return handleBestListing(ctx);
@@ -140,6 +156,24 @@ async function route(
     if (!segments[2] && method === "POST") {
       return handleSubmitOrder(ctx);
     }
+  }
+
+  // ─── /v1/activity ──────────────────────────────────────────────────
+
+  if (resource === "activity" && method === "GET") {
+    return handleGetActivity(ctx);
+  }
+
+  // ─── /v1/config ─────────────────────────────────────────────────
+
+  if (resource === "config" && method === "GET") {
+    if (!ctx.env.PROTOCOL_FEE_RECIPIENT) {
+      return jsonError(503, "Protocol fee recipient is not configured");
+    }
+    return jsonResponse({
+      protocolFeeBps: Number(ctx.env.PROTOCOL_FEE_BPS || "50"),
+      protocolFeeRecipient: ctx.env.PROTOCOL_FEE_RECIPIENT || "",
+    });
   }
 
   // ─── /v1/collections/:address/stats ─────────────────────────────────

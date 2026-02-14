@@ -1,0 +1,21 @@
+{
+  "name": "@oob/indexer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OOB Indexer — monitors Seaport on-chain events and manages order lifecycle",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^0.10.4",
+    "ethers": "^6.16.0",
+    "solc": "^0.8.28"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241205.0",
+    "typescript": "^5.7.2",
+    "wrangler": "^3.99.0"
+  }
+}

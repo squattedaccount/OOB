@@ -10,7 +10,9 @@
     "build": "npm run build --workspace=packages/sdk",
     "test": "npm run test --workspace=packages/sdk",
     "dev:api": "npm run dev --workspace=packages/api",
+    "dev:indexer": "npm run dev --workspace=packages/indexer",
     "deploy:api": "npm run deploy --workspace=packages/api",
+    "deploy:indexer": "npm run deploy --workspace=packages/indexer",
     "lint": "echo 'TODO: add linter'"
   },
   "repository": {

@@ -47,12 +47,12 @@ describe("Constants", () => {
     expect(SUPPORTED_CHAINS[8453].nativeSymbol).toBe("ETH");
   });
 
-  it("DEFAULT_FEE_BPS is 50 (0.5%)", () => {
-    expect(DEFAULT_FEE_BPS).toBe(50);
+  it("DEFAULT_FEE_BPS is 0 (marketplace fee defaults to none)", () => {
+    expect(DEFAULT_FEE_BPS).toBe(0);
   });
 
-  it("DEFAULT_FEE_RECIPIENT is a valid address", () => {
-    expect(DEFAULT_FEE_RECIPIENT).toMatch(/^0x[0-9a-fA-F]{40}$/);
+  it("DEFAULT_FEE_RECIPIENT is empty (marketplace sets their own)", () => {
+    expect(DEFAULT_FEE_RECIPIENT).toBe("");
   });
 
   it("DEFAULT_LISTING_DURATION is 30 days in seconds", () => {

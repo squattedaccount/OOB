@@ -167,26 +167,16 @@ describe("ApiClient", () => {
   });
 
   describe("cancelOrder", () => {
-    it("sends DELETE with txHash", async () => {
+    it("sends DELETE with signature", async () => {
       mockFetch.mockResolvedValue(
         new Response(JSON.stringify({ orderHash: "0xhash", status: "cancelled" }), { status: 200 }),
       );
 
-      await api.cancelOrder("0xhash", "0xtx");
+      await api.cancelOrder("0xhash", "0xsig123");
 
       expect(mockFetch.mock.calls[0][1].method).toBe("DELETE");
       const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-      expect(body.txHash).toBe("0xtx");
-    });
-
-    it("sends DELETE without body when no txHash", async () => {
-      mockFetch.mockResolvedValue(
-        new Response(JSON.stringify({ orderHash: "0xhash", status: "cancelled" }), { status: 200 }),
-      );
-
-      await api.cancelOrder("0xhash");
-
-      expect(mockFetch.mock.calls[0][1].body).toBeUndefined();
+      expect(body.signature).toBe("0xsig123");
     });
   });
 

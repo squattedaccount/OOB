@@ -28,8 +28,8 @@ describe("OpenOrderBook", () => {
     it("sets default config values", () => {
       expect(oob.config.chainId).toBe(8453);
       expect(oob.config.apiUrl).toBe(DEFAULT_API_URL);
-      expect(oob.config.feeBps).toBe(DEFAULT_FEE_BPS);
-      expect(oob.config.feeRecipient).toBe(DEFAULT_FEE_RECIPIENT);
+      expect(oob.config.feeBps).toBe(0);
+      expect(oob.config.feeRecipient).toBe("");
     });
 
     it("accepts custom config", () => {

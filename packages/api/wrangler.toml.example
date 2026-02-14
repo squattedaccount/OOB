@@ -4,8 +4,8 @@ compatibility_date = "2024-11-15"
 
 [vars]
 # Protocol fee — OOB takes this on every order, enforced server-side
-# TODO: Replace with your actual treasury address before deploying
-PROTOCOL_FEE_RECIPIENT = "0x56A8Ad381232d6724Ae8AbDE838d70d1AE628575"
+# IMPORTANT: Replace with your actual treasury address
+PROTOCOL_FEE_RECIPIENT = "0xYOUR_TREASURY_ADDRESS_HERE"
 PROTOCOL_FEE_BPS = "50"  # 0.5% protocol fee
 
 # Rate limiting defaults (per minute)
@@ -22,7 +22,7 @@ RATE_LIMIT_REGISTERED_WRITES = "60"
 # Create with: wrangler kv:namespace create "OOB_RATE_LIMIT"
 [[kv_namespaces]]
 binding = "OOB_RATE_LIMIT"
-id = "d928a40abd4645d3b672639a45382519"
+id = "YOUR_KV_NAMESPACE_ID"
 
 # Durable Objects for WebSocket streams
 [durable_objects]

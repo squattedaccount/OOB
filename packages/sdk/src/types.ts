@@ -108,16 +108,24 @@ export interface OobConfig {
   apiUrl?: string;
   /** Optional API key for higher rate limits */
   apiKey?: string;
-  /** Marketplace fee in basis points. Defaults to 50 (0.5%) */
+  /** Marketplace fee in basis points (your marketplace's cut). Defaults to 0. */
   feeBps?: number;
-  /** Fee recipient address. Defaults to OOB treasury. */
+  /** Marketplace fee recipient address. Required if feeBps > 0. */
   feeRecipient?: string;
 }
 
+/**
+ * Protocol fee config returned by GET /v1/config.
+ * Fetched at runtime so OOB can change the fee globally without SDK updates.
+ */
+export interface ProtocolConfig {
+  protocolFeeBps: number;
+  protocolFeeRecipient: string;
+}
+
 export const DEFAULT_API_URL = "https://api.openorderbook.xyz";
-export const DEFAULT_FEE_BPS = 50;
-// TODO: Replace with actual treasury address before mainnet
-export const DEFAULT_FEE_RECIPIENT = "0x0000000000000000000000000000000000000001";
+export const DEFAULT_FEE_BPS = 0;
+export const DEFAULT_FEE_RECIPIENT = "";
 export const DEFAULT_LISTING_DURATION = 30 * 24 * 60 * 60; // 30 days
 export const DEFAULT_OFFER_DURATION = 7 * 24 * 60 * 60; // 7 days
 

@@ -10,15 +10,20 @@ Any marketplace, bot, or AI agent can read and write orders through a single sha
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌──────────────┐
-│  Your App   │────▶│   OOB API   │────▶│  Neon Postgres│
-│  (SDK/REST) │◀────│  (CF Worker) │◀────│  (Orders DB)  │
-└─────────────┘     └──────┬──────┘     └──────────────┘
-                           │
-                    ┌──────▼──────┐
-                    │  WebSocket  │
-                    │  (Durable   │
-                    │   Objects)  │
-                    └─────────────┘
+│  Your App   │────▶│   OOB API   │────▶│              │
+│  (SDK/REST) │◀────│  (CF Worker) │◀────│  Neon        │
+└─────────────┘     └──────┬──────┘     │  Postgres    │
+                           │            │  (Orders DB) │
+                    ┌──────▼──────┐     │              │
+                    │  WebSocket  │     │              │
+                    │  (Durable   │     └──────▲───────┘
+                    │   Objects)  │            │
+                    └─────────────┘     ┌──────┴───────┐
+                                        │ OOB Indexer  │
+  Seaport v1.6 ─── Alchemy/Moralis ───▶│ (CF Worker)  │
+  on-chain events   webhooks            │ cron: expire │
+                                        │ + stale check│
+                                        └──────────────┘
 ```
 
 ## Packages
@@ -27,6 +32,7 @@ Any marketplace, bot, or AI agent can read and write orders through a single sha
 |---------|-------------|------|
 | **@oob/sdk** | TypeScript SDK for interacting with the order book | `packages/sdk` |
 | **oob-api** | Cloudflare Worker — the public REST + WebSocket API | `packages/api` |
+| **@oob/indexer** | Cloudflare Worker — on-chain event monitor + order lifecycle | `packages/indexer` |
 
 ## Quick Start
 
@@ -36,6 +42,9 @@ npm install
 
 # Run API locally
 npm run dev:api
+
+# Run Indexer locally
+npm run dev:indexer
 
 # Build SDK
 npm run build
