@@ -1,6 +1,6 @@
 # Open Order Book (OOB)
 
-A decentralized, open-source NFT order book protocol built on [Seaport](https://github.com/ProjectOpenSea/seaport).
+Open-source NFT order book protocol built on [Seaport](https://github.com/ProjectOpenSea/seaport).
 
 **No gatekeepers. No API keys required. No vendor lock-in.**
 
