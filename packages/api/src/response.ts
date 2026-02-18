@@ -18,8 +18,9 @@ export function jsonResponse(data: unknown, status = 200): Response {
   });
 }
 
-export function jsonError(status: number, error: string): Response {
-  return new Response(JSON.stringify({ error }), {
+export function jsonError(status: number, error: string | Record<string, unknown>): Response {
+  const body = typeof error === "string" ? { error } : { error: (error as any).message ?? "Error", ...error };
+  return new Response(JSON.stringify(body), {
     status,
     headers: {
       "Content-Type": "application/json",

@@ -7,12 +7,15 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "migrate": "npx tsx scripts/migrate.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241106.0",
     "postgres": "^3.4.8",
     "typescript": "^5.4.0",
+    "vitest": "^2.0.0",
     "wrangler": "^4.58.0"
   },
   "dependencies": {

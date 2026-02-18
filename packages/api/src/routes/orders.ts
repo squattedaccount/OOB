@@ -15,6 +15,7 @@ import { ethers } from "ethers";
 
 const ETH_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const HEX_STRING_RE = /^0x[0-9a-fA-F]+$/;
+const ORDER_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 const VALID_CHAINS = new Set([1, 8453, 84532, 999, 2020, 202601, 2741]);
 const MAX_BODY_SIZE = 64 * 1024; // 64 KB
 const MAX_ACTIVE_ORDERS_PER_OFFERER = 500;
@@ -404,6 +405,12 @@ export async function handleGetOrders(ctx: RouteContext): Promise<Response> {
     return jsonError(400, "Invalid collection address");
   }
   const tokenId = params.get("tokenId");
+  // tokenIds: comma-separated list OR repeated params e.g. tokenIds=1,2,3 or tokenIds=1&tokenIds=2
+  const tokenIdsRaw = params.getAll("tokenIds").flatMap((v) => v.split(",")).map((v) => v.trim()).filter(Boolean);
+  const tokenIds = tokenIdsRaw.length > 0 ? [...new Set(tokenIdsRaw)] : null;
+  if (tokenIds && tokenIds.length > 50) {
+    return jsonError(400, "tokenIds filter supports at most 50 values");
+  }
   const type = params.get("type"); // 'listing' | 'offer'
   const offerer = params.get("offerer")?.toLowerCase();
   if (offerer && !isValidAddress(offerer)) {
@@ -441,6 +448,10 @@ export async function handleGetOrders(ctx: RouteContext): Promise<Response> {
   if (tokenId) {
     conditions.push(`token_id = $${paramIdx++}`);
     queryParams.push(tokenId);
+  } else if (tokenIds) {
+    // ANY($N) with a text[] parameter — safe, no string interpolation of user data
+    conditions.push(`token_id = ANY($${paramIdx++})`);
+    queryParams.push(tokenIds);
   }
   if (safeType) {
     conditions.push(`order_type = $${paramIdx++}`);
@@ -471,14 +482,21 @@ export async function handleGetOrders(ctx: RouteContext): Promise<Response> {
   if (sortBy === "price_asc") orderClause = "ORDER BY CAST(price_wei AS NUMERIC) ASC, order_hash ASC";
   if (sortBy === "price_desc") orderClause = "ORDER BY CAST(price_wei AS NUMERIC) DESC, order_hash DESC";
 
-  // Apply cursor condition for keyset pagination
+  // Apply cursor condition for keyset pagination.
+  // price_desc uses two separate conditions to handle mixed-direction sort correctly:
+  // (price DESC, order_hash DESC) cannot use a single row-value comparison because
+  // both columns must sort in the same direction for tuple comparison to be valid.
   if (cursorDecoded) {
     if (sortBy === "price_asc" && cursorDecoded.price_wei && cursorDecoded.order_hash) {
+      // Both ASC — single tuple comparison is safe
       conditions.push(`(CAST(price_wei AS NUMERIC), order_hash) > (CAST($${paramIdx++} AS NUMERIC), $${paramIdx++})`);
       queryParams.push(cursorDecoded.price_wei, cursorDecoded.order_hash);
     } else if (sortBy === "price_desc" && cursorDecoded.price_wei && cursorDecoded.order_hash) {
-      conditions.push(`(CAST(price_wei AS NUMERIC), order_hash) < (CAST($${paramIdx++} AS NUMERIC), $${paramIdx++})`);
-      queryParams.push(cursorDecoded.price_wei, cursorDecoded.order_hash);
+      // Mixed direction: price DESC, order_hash DESC — expand to avoid tuple comparison bug
+      conditions.push(
+        `(CAST(price_wei AS NUMERIC) < CAST($${paramIdx++} AS NUMERIC) OR (CAST(price_wei AS NUMERIC) = CAST($${paramIdx++} AS NUMERIC) AND order_hash < $${paramIdx++}))`,
+      );
+      queryParams.push(cursorDecoded.price_wei, cursorDecoded.price_wei, cursorDecoded.order_hash);
     } else if (cursorDecoded.created_at && cursorDecoded.order_hash) {
       conditions.push(`(created_at, order_hash) < ($${paramIdx++}::timestamptz, $${paramIdx++})`);
       queryParams.push(cursorDecoded.created_at, cursorDecoded.order_hash);
@@ -538,7 +556,7 @@ export async function handleGetOrders(ctx: RouteContext): Promise<Response> {
 export async function handleGetOrder(ctx: RouteContext): Promise<Response> {
   const orderHash = ctx.segments[2]; // ["v1", "orders", "<hash>"]
   if (!orderHash) return jsonError(400, "Missing order hash");
-  if (!HEX_STRING_RE.test(orderHash)) return jsonError(400, "Invalid order hash format");
+  if (!ORDER_HASH_RE.test(orderHash)) return jsonError(400, "Invalid order hash format");
 
   const sql = getPooledSqlClient(ctx.env);
 
@@ -559,13 +577,17 @@ export async function handleGetOrder(ctx: RouteContext): Promise<Response> {
 
 export async function handleBestListing(ctx: RouteContext): Promise<Response> {
   const { params } = ctx;
-  const chainId = params.get("chainId");
+  const chainIdRaw = params.get("chainId");
   const collection = params.get("collection")?.toLowerCase();
   const tokenId = params.get("tokenId");
 
-  if (!chainId || !collection) {
+  if (!chainIdRaw || !collection) {
     return jsonError(400, "Missing chainId or collection");
   }
+  if (!isValidChainId(chainIdRaw)) {
+    return jsonError(400, "Invalid chainId parameter");
+  }
+  const chainId = Number(chainIdRaw);
 
   const sql = getPooledSqlClient(ctx.env);
   const now = Math.floor(Date.now() / 1000);
@@ -608,13 +630,17 @@ export async function handleBestListing(ctx: RouteContext): Promise<Response> {
 
 export async function handleBestOffer(ctx: RouteContext): Promise<Response> {
   const { params } = ctx;
-  const chainId = params.get("chainId");
+  const chainIdRaw = params.get("chainId");
   const collection = params.get("collection")?.toLowerCase();
   const tokenId = params.get("tokenId");
 
-  if (!chainId || !collection) {
+  if (!chainIdRaw || !collection) {
     return jsonError(400, "Missing chainId or collection");
   }
+  if (!isValidChainId(chainIdRaw)) {
+    return jsonError(400, "Invalid chainId parameter");
+  }
+  const chainId = Number(chainIdRaw);
 
   const sql = getPooledSqlClient(ctx.env);
   const now = Math.floor(Date.now() / 1000);
@@ -863,7 +889,7 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
 export async function handleCancelOrder(ctx: RouteContext): Promise<Response> {
   const orderHash = ctx.segments[2];
   if (!orderHash) return jsonError(400, "Missing order hash");
-  if (!HEX_STRING_RE.test(orderHash)) return jsonError(400, "Invalid order hash format");
+  if (!ORDER_HASH_RE.test(orderHash)) return jsonError(400, "Invalid order hash format");
 
   let body: any = {};
   try {
@@ -951,12 +977,16 @@ export async function handleCancelOrder(ctx: RouteContext): Promise<Response> {
 
 export async function handleCollectionStats(ctx: RouteContext): Promise<Response> {
   const { params } = ctx;
-  const chainId = params.get("chainId");
+  const chainIdRaw = params.get("chainId");
   const collection = ctx.segments[2]?.toLowerCase(); // ["v1", "collections", "<address>", "stats"]
 
-  if (!chainId || !collection) {
+  if (!chainIdRaw || !collection) {
     return jsonError(400, "Missing chainId or collection address");
   }
+  if (!isValidChainId(chainIdRaw)) {
+    return jsonError(400, "Invalid chainId parameter");
+  }
+  const chainId = Number(chainIdRaw);
 
   const sql = getPooledSqlClient(ctx.env);
   const now = Math.floor(Date.now() / 1000);
@@ -1319,6 +1349,749 @@ async function processSingleOrderSubmit(
   return { orderHash, status: "active" };
 }
 
+// ─── GET /v1/orders/:hash/fill-tx ───────────────────────────────────────────
+
+const SEAPORT_ADDRESS = "0x0000000000000068F116a894984e2DB1123eB395";
+
+const FULFILL_ORDER_SIG =
+  "fulfillOrder((((uint8,address,uint256,uint256,uint256)[],(uint8,address,uint256,uint256,uint256,address)[],uint8,uint256,uint256,bytes32,uint256,bytes32,uint256),bytes),bytes32)";
+
+const FULFILL_ADVANCED_ORDER_SIG =
+  "fulfillAdvancedOrder((((uint8,address,uint256,uint256,uint256)[],(uint8,address,uint256,uint256,uint256,address)[],uint8,uint256,uint256,bytes32,uint256,bytes32,uint256),uint120,uint120,bytes,bytes),(uint256,uint8,uint256,uint256,bytes32[])[],bytes32,address)";
+
+/**
+ * Encode calldata for Seaport fulfillOrder (no tip).
+ * Uses ethers AbiCoder — already a dependency, no new packages needed.
+ */
+function encodeFulfillOrder(orderJson: any, signature: string): string {
+  const iface = new ethers.Interface([
+    `function ${FULFILL_ORDER_SIG} payable returns (bool)`,
+  ]);
+
+  const params = buildOrderParameters(orderJson);
+
+  return iface.encodeFunctionData("fulfillOrder", [
+    { parameters: params, signature },
+    "0x0000000000000000000000000000000000000000000000000000000000000000", // fulfillerConduitKey
+  ]);
+}
+
+/**
+ * Encode calldata for Seaport fulfillAdvancedOrder (with tip).
+ */
+function encodeFulfillAdvancedOrder(
+  orderJson: any,
+  signature: string,
+  tipItemType: number,
+  tipToken: string,
+  tipAmount: bigint,
+  tipRecipient: string,
+): string {
+  const iface = new ethers.Interface([
+    `function ${FULFILL_ADVANCED_ORDER_SIG} payable returns (bool)`,
+  ]);
+
+  const params = buildOrderParameters(orderJson);
+
+  const considerationWithTip = [
+    ...params.consideration,
+    {
+      itemType: tipItemType,
+      token: tipToken,
+      identifierOrCriteria: 0n,
+      startAmount: tipAmount,
+      endAmount: tipAmount,
+      recipient: tipRecipient,
+    },
+  ];
+
+  return iface.encodeFunctionData("fulfillAdvancedOrder", [
+    {
+      parameters: { ...params, consideration: considerationWithTip },
+      numerator: 1n,
+      denominator: 1n,
+      signature,
+      extraData: "0x",
+    },
+    [], // criteriaResolvers
+    "0x0000000000000000000000000000000000000000000000000000000000000000", // fulfillerConduitKey
+    "0x0000000000000000000000000000000000000000", // recipient (0 = msg.sender)
+  ]);
+}
+
+/**
+ * Convert stored orderJson (string amounts) into the struct ethers expects (bigints).
+ */
+function buildOrderParameters(orderJson: any) {
+  return {
+    offerer: orderJson.offerer,
+    zone: orderJson.zone,
+    offer: (orderJson.offer || []).map((item: any) => ({
+      itemType: Number(item.itemType),
+      token: item.token,
+      identifierOrCriteria: BigInt(item.identifierOrCriteria),
+      startAmount: BigInt(item.startAmount),
+      endAmount: BigInt(item.endAmount),
+    })),
+    consideration: (orderJson.consideration || []).map((item: any) => ({
+      itemType: Number(item.itemType),
+      token: item.token,
+      identifierOrCriteria: BigInt(item.identifierOrCriteria),
+      startAmount: BigInt(item.startAmount),
+      endAmount: BigInt(item.endAmount),
+      recipient: item.recipient,
+    })),
+    orderType: Number(orderJson.orderType),
+    startTime: BigInt(orderJson.startTime),
+    endTime: BigInt(orderJson.endTime),
+    zoneHash: orderJson.zoneHash,
+    salt: BigInt(orderJson.salt),
+    conduitKey: orderJson.conduitKey,
+    totalOriginalConsiderationItems: BigInt((orderJson.consideration || []).length),
+  };
+}
+
+/**
+ * GET /v1/orders/:hash/fill-tx
+ *
+ * Returns a ready-to-sign transaction object for filling a Seaport listing.
+ * The caller just needs to sign and broadcast — no Seaport knowledge required.
+ *
+ * Query params:
+ *   - buyer (required): address of the wallet that will send the transaction
+ *   - tipRecipient (optional): address to receive a marketplace tip
+ *   - tipBps (optional): tip in basis points (e.g. 100 = 1%)
+ *
+ * Response:
+ *   {
+ *     to: string,           // Seaport contract address
+ *     data: string,         // ABI-encoded calldata (hex)
+ *     value: string,        // ETH value in wei (as decimal string) — "0" for ERC20 orders
+ *     chainId: number,
+ *     orderHash: string,
+ *     orderType: "listing" | "offer",
+ *     currency: string,     // payment token address (0x0...0 = native ETH)
+ *     priceWei: string,
+ *   }
+ *
+ * Only listings are supported for fill-tx (offers require the seller to initiate).
+ */
+export async function handleFillTx(ctx: RouteContext): Promise<Response> {
+  const orderHash = ctx.segments[2];
+  if (!orderHash) return jsonError(400, "Missing order hash");
+  if (!ORDER_HASH_RE.test(orderHash)) return jsonError(400, "Invalid order hash format");
+
+  // buyer param — required so agents know which address to send from
+  const buyer = ctx.params.get("buyer")?.toLowerCase();
+  if (!buyer) return jsonError(400, "Missing required query param: buyer");
+  if (!isValidAddress(buyer)) return jsonError(400, "Invalid buyer address");
+
+  // Optional tip
+  const tipRecipientRaw = ctx.params.get("tipRecipient");
+  const tipBpsRaw = ctx.params.get("tipBps");
+  if ((tipRecipientRaw && !tipBpsRaw) || (!tipRecipientRaw && tipBpsRaw)) {
+    return jsonError(400, "tipRecipient and tipBps must be provided together");
+  }
+  const hasTip = !!(tipRecipientRaw && tipBpsRaw);
+
+  if (tipRecipientRaw && !isValidAddress(tipRecipientRaw)) {
+    return jsonError(400, "Invalid tipRecipient address");
+  }
+  const tipBps = hasTip ? Number(tipBpsRaw) : 0;
+  if (hasTip && (!Number.isFinite(tipBps) || tipBps <= 0 || tipBps > 10000)) {
+    return jsonError(400, "tipBps must be between 1 and 10000");
+  }
+
+  const sql = getPooledSqlClient(ctx.env);
+
+  let row: any;
+  try {
+    const rows = await sql`
+      SELECT * FROM seaport_orders WHERE order_hash = ${orderHash}
+    `;
+    if (rows.length === 0) return jsonError(404, "Order not found");
+    row = rows[0];
+  } catch (err: any) {
+    console.error("[oob-api] fill-tx: DB error:", err);
+    return jsonError(500, "Failed to fetch order");
+  }
+
+  // Only active listings can be filled via this endpoint
+  if (row.order_type !== "listing") {
+    return jsonError(400, {
+      code: "UNSUPPORTED_ORDER_TYPE",
+      message: "fill-tx only supports listings. Offers must be filled by the NFT owner on-chain.",
+      orderType: row.order_type,
+    });
+  }
+  if (row.status !== "active") {
+    return jsonError(409, {
+      code: "ORDER_NOT_ACTIVE",
+      message: `Order cannot be filled because it is ${row.status}.`,
+      status: row.status,
+      orderHash: row.order_hash,
+      ...(row.status === "filled" ? { filledTxHash: row.filled_tx_hash, filledAt: row.filled_at } : {}),
+      ...(row.status === "cancelled" ? { cancelledTxHash: row.cancelled_tx_hash, cancelledAt: row.cancelled_at } : {}),
+    });
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (Number(row.end_time) <= now) {
+    return jsonError(409, {
+      code: "ORDER_EXPIRED",
+      message: "Order has expired and can no longer be filled.",
+      orderHash: row.order_hash,
+      expiredAt: Number(row.end_time),
+      expiredAgo: `${Math.floor((now - Number(row.end_time)) / 60)} minutes ago`,
+    });
+  }
+
+  // Prevent buyer from filling their own listing
+  if (row.offerer?.toLowerCase() === buyer) {
+    return jsonError(400, {
+      code: "SELF_FILL",
+      message: "Buyer address matches the order offerer. You cannot fill your own listing.",
+      offerer: row.offerer,
+      buyer,
+    });
+  }
+
+  const orderJson = typeof row.order_json === "string"
+    ? JSON.parse(row.order_json)
+    : row.order_json;
+  const signature = row.signature as string;
+
+  // Calculate ETH value the buyer must send (sum of all NATIVE consideration items)
+  let valueWei = 0n;
+  const isNativePayment = row.currency === "0x0000000000000000000000000000000000000000";
+  if (isNativePayment) {
+    for (const item of (orderJson.consideration || [])) {
+      if (Number(item.itemType) === 0) { // NATIVE
+        valueWei += BigInt(item.startAmount);
+      }
+    }
+  }
+
+  let calldata: string;
+  try {
+    if (hasTip) {
+      const tipAmount = (BigInt(row.price_wei) * BigInt(tipBps)) / 10000n;
+      if (tipAmount <= 0n) return jsonError(400, "Tip amount rounds to zero — increase tipBps or use a higher-priced order");
+
+      const tipItemType = isNativePayment ? 0 : 1; // NATIVE or ERC20
+      const tipToken = isNativePayment
+        ? "0x0000000000000000000000000000000000000000"
+        : row.currency;
+
+      if (isNativePayment) valueWei += tipAmount;
+
+      calldata = encodeFulfillAdvancedOrder(
+        orderJson,
+        signature,
+        tipItemType,
+        tipToken,
+        tipAmount,
+        tipRecipientRaw!,
+      );
+    } else {
+      calldata = encodeFulfillOrder(orderJson, signature);
+    }
+  } catch (err: any) {
+    console.error("[oob-api] fill-tx: ABI encoding error:", err);
+    return jsonError(500, {
+      code: "CALLDATA_ENCODING_FAILED",
+      message: "Failed to encode Seaport transaction calldata. The stored order data may be malformed.",
+      orderHash: row.order_hash,
+      detail: err?.message ?? "Unknown encoding error",
+    });
+  }
+
+  const cm = resolveCurrency(row.chain_id, row.currency);
+
+  return jsonResponse({
+    to: SEAPORT_ADDRESS,
+    data: calldata,
+    value: valueWei.toString(),
+    chainId: row.chain_id,
+    orderHash: row.order_hash,
+    orderType: row.order_type,
+    nftContract: row.nft_contract,
+    tokenId: row.token_id,
+    tokenStandard: row.token_standard,
+    offerer: row.offerer,
+    currency: row.currency,
+    currencySymbol: cm.currencySymbol,
+    currencyDecimals: cm.currencyDecimals,
+    priceWei: row.price_wei,
+    priceDecimal: formatPriceDecimal(row.price_wei, cm.currencyDecimals),
+    expiresAt: Number(row.end_time),
+    ...(hasTip ? { tipBps, tipRecipient: tipRecipientRaw } : {}),
+  });
+}
+
+// ─── POST /v1/orders/batch/fill-tx ──────────────────────────────────────────
+//
+// Sweep endpoint: given an array of order hashes, returns an array of
+// ready-to-sign transactions (one per order). The agent broadcasts them
+// sequentially or in parallel depending on their wallet setup.
+//
+// Why not a single fulfillAvailableOrders call?
+//   fulfillAvailableOrders requires fulfillment component arrays that map
+//   offer/consideration items across orders — complex to compute server-side
+//   for heterogeneous orders (different collections, currencies, royalties).
+//   Returning individual transactions is simpler, more predictable, and lets
+//   the agent decide execution order and handle partial failures gracefully.
+//
+// Request body:
+//   { buyer: string, orderHashes: string[], tipRecipient?: string, tipBps?: number }
+//
+// Response:
+//   { transactions: FillTxResult[], totalValueWei: string, currency: string | null }
+//   Each FillTxResult: { orderHash, to, data, value, chainId, nftContract, tokenId,
+//                        priceWei, currency, expiresAt, error? }
+//   Orders that cannot be filled (expired, filled, wrong type) are returned with
+//   an `error` field instead of calldata so the agent can skip them cleanly.
+
+const MAX_BATCH_FILL_SIZE = 20;
+
+export async function handleBatchFillTx(ctx: RouteContext): Promise<Response> {
+  let body: any;
+  try {
+    const raw = await readBodyWithLimit(ctx.request, MAX_BODY_SIZE * MAX_BATCH_FILL_SIZE);
+    body = JSON.parse(raw);
+  } catch (err: any) {
+    if (err.message === "BODY_TOO_LARGE") return jsonError(413, "Request body too large");
+    return jsonError(400, "Invalid JSON body");
+  }
+
+  const { buyer, orderHashes, tipRecipient: tipRecipientRaw, tipBps: tipBpsRaw } = body;
+
+  if (!buyer || typeof buyer !== "string") return jsonError(400, "Missing required field: buyer");
+  if (!isValidAddress(buyer)) return jsonError(400, "Invalid buyer address");
+  if (!Array.isArray(orderHashes) || orderHashes.length === 0) {
+    return jsonError(400, "Missing or empty 'orderHashes' array");
+  }
+  if (orderHashes.length > MAX_BATCH_FILL_SIZE) {
+    return jsonError(400, `Batch size exceeds maximum (${MAX_BATCH_FILL_SIZE})`);
+  }
+  for (const h of orderHashes) {
+    if (typeof h !== "string" || !ORDER_HASH_RE.test(h)) {
+      return jsonError(400, `Invalid order hash in array: ${h}`);
+    }
+  }
+
+  if ((tipRecipientRaw && tipBpsRaw == null) || (!tipRecipientRaw && tipBpsRaw != null)) {
+    return jsonError(400, "tipRecipient and tipBps must be provided together");
+  }
+  const hasTip = !!(tipRecipientRaw && tipBpsRaw != null);
+  if (hasTip) {
+    if (!isValidAddress(tipRecipientRaw)) return jsonError(400, "Invalid tipRecipient address");
+    const tipBpsNum = Number(tipBpsRaw);
+    if (!Number.isFinite(tipBpsNum) || tipBpsNum <= 0 || tipBpsNum > 10000) {
+      return jsonError(400, "tipBps must be between 1 and 10000");
+    }
+  }
+  const tipBps = hasTip ? Number(tipBpsRaw) : 0;
+
+  const sql = getPooledSqlClient(ctx.env);
+  const now = Math.floor(Date.now() / 1000);
+  const buyerLower = buyer.toLowerCase();
+
+  // Fetch all requested orders in one query
+  let rows: any[];
+  try {
+    rows = await sql(
+      `SELECT * FROM seaport_orders WHERE order_hash = ANY($1)`,
+      [orderHashes],
+    );
+  } catch (err: any) {
+    console.error("[oob-api] batch fill-tx: DB error:", err);
+    return jsonError(500, "Failed to fetch orders");
+  }
+
+  // Index rows by hash for O(1) lookup, preserving request order
+  const rowByHash = new Map<string, any>();
+  for (const row of rows) rowByHash.set(row.order_hash, row);
+
+  const transactions: any[] = [];
+  let totalValueWei = 0n;
+  let commonCurrency: string | null = null;
+  let mixedCurrencies = false;
+
+  for (const orderHash of orderHashes) {
+    const row = rowByHash.get(orderHash);
+
+    // Not found
+    if (!row) {
+      transactions.push({
+        orderHash,
+        error: { code: "NOT_FOUND", message: "Order not found in the order book" },
+      });
+      continue;
+    }
+
+    // Offers not supported
+    if (row.order_type !== "listing") {
+      transactions.push({
+        orderHash,
+        error: {
+          code: "UNSUPPORTED_ORDER_TYPE",
+          message: "fill-tx only supports listings. Offers must be filled by the NFT owner on-chain.",
+          orderType: row.order_type,
+        },
+      });
+      continue;
+    }
+
+    // Not active
+    if (row.status !== "active") {
+      transactions.push({
+        orderHash,
+        error: {
+          code: "ORDER_NOT_ACTIVE",
+          message: `Order cannot be filled because it is ${row.status}.`,
+          status: row.status,
+          ...(row.status === "filled" ? { filledTxHash: row.filled_tx_hash, filledAt: row.filled_at } : {}),
+          ...(row.status === "cancelled" ? { cancelledTxHash: row.cancelled_tx_hash, cancelledAt: row.cancelled_at } : {}),
+        },
+      });
+      continue;
+    }
+
+    // Expired
+    if (Number(row.end_time) <= now) {
+      transactions.push({
+        orderHash,
+        error: {
+          code: "ORDER_EXPIRED",
+          message: "Order has expired and can no longer be filled.",
+          expiredAt: Number(row.end_time),
+          expiredAgo: `${Math.floor((now - Number(row.end_time)) / 60)} minutes ago`,
+        },
+      });
+      continue;
+    }
+
+    // Self-fill
+    if (row.offerer?.toLowerCase() === buyerLower) {
+      transactions.push({
+        orderHash,
+        error: {
+          code: "SELF_FILL",
+          message: "Buyer address matches the order offerer. You cannot fill your own listing.",
+          offerer: row.offerer,
+        },
+      });
+      continue;
+    }
+
+    const orderJson = typeof row.order_json === "string"
+      ? JSON.parse(row.order_json)
+      : row.order_json;
+    const signature = row.signature as string;
+
+    const isNativePayment = row.currency === "0x0000000000000000000000000000000000000000";
+    let valueWei = 0n;
+    if (isNativePayment) {
+      for (const item of (orderJson.consideration || [])) {
+        if (Number(item.itemType) === 0) valueWei += BigInt(item.startAmount);
+      }
+    }
+
+    // Track currency consistency for the summary field
+    if (commonCurrency === null) {
+      commonCurrency = row.currency;
+    } else if (commonCurrency !== row.currency) {
+      mixedCurrencies = true;
+    }
+
+    let calldata: string;
+    try {
+      if (hasTip) {
+        const tipAmount = (BigInt(row.price_wei) * BigInt(tipBps)) / 10000n;
+        if (tipAmount <= 0n) {
+          transactions.push({
+            orderHash,
+            error: {
+              code: "TIP_TOO_SMALL",
+              message: "Tip amount rounds to zero for this order price. Increase tipBps.",
+              priceWei: row.price_wei,
+              tipBps,
+            },
+          });
+          continue;
+        }
+        const tipItemType = isNativePayment ? 0 : 1;
+        const tipToken = isNativePayment ? "0x0000000000000000000000000000000000000000" : row.currency;
+        if (isNativePayment) valueWei += tipAmount;
+        calldata = encodeFulfillAdvancedOrder(orderJson, signature, tipItemType, tipToken, tipAmount, tipRecipientRaw);
+      } else {
+        calldata = encodeFulfillOrder(orderJson, signature);
+      }
+    } catch (err: any) {
+      console.error("[oob-api] batch fill-tx: encoding error for", orderHash, err);
+      transactions.push({
+        orderHash,
+        error: {
+          code: "CALLDATA_ENCODING_FAILED",
+          message: "Failed to encode Seaport transaction calldata. The stored order data may be malformed.",
+          detail: err?.message ?? "Unknown encoding error",
+        },
+      });
+      continue;
+    }
+
+    totalValueWei += valueWei;
+    const cm = resolveCurrency(row.chain_id, row.currency);
+
+    transactions.push({
+      orderHash: row.order_hash,
+      to: SEAPORT_ADDRESS,
+      data: calldata,
+      value: valueWei.toString(),
+      chainId: row.chain_id,
+      nftContract: row.nft_contract,
+      tokenId: row.token_id,
+      tokenStandard: row.token_standard,
+      offerer: row.offerer,
+      currency: row.currency,
+      currencySymbol: cm.currencySymbol,
+      currencyDecimals: cm.currencyDecimals,
+      priceWei: row.price_wei,
+      priceDecimal: formatPriceDecimal(row.price_wei, cm.currencyDecimals),
+      expiresAt: Number(row.end_time),
+      ...(hasTip ? { tipBps, tipRecipient: tipRecipientRaw } : {}),
+    });
+  }
+
+  const succeeded = transactions.filter((t) => !t.error).length;
+  const failed = transactions.filter((t) => t.error).length;
+
+  return jsonResponse({
+    transactions,
+    succeeded,
+    failed,
+    total: transactions.length,
+    // Total ETH/native value the buyer must send across all valid transactions
+    totalValueWei: totalValueWei.toString(),
+    // null if orders use mixed currencies (agent must sum per-currency themselves)
+    currency: mixedCurrencies ? null : commonCurrency,
+  });
+}
+
+// ─── GET /v1/orders/best-listing/fill-tx ────────────────────────────────────
+//
+// Floor-snipe shortcut: finds the cheapest active listing for a collection
+// (or specific token) and returns the fill-tx in one call.
+// Saves agents a round-trip vs. GET best-listing → GET fill-tx.
+//
+// Query params:
+//   - chainId (required)
+//   - collection (required)
+//   - tokenId (optional): specific token, otherwise collection floor
+//   - buyer (required): wallet address that will send the tx
+//   - tipRecipient (optional)
+//   - tipBps (optional)
+
+export async function handleBestListingFillTx(ctx: RouteContext): Promise<Response> {
+  const { params } = ctx;
+  const chainIdRaw = params.get("chainId");
+  const collection = params.get("collection")?.toLowerCase();
+  const tokenId = params.get("tokenId");
+  const buyer = params.get("buyer")?.toLowerCase();
+
+  if (!chainIdRaw || !isValidChainId(chainIdRaw)) {
+    return jsonError(400, "Missing or invalid chainId parameter");
+  }
+  if (!collection) return jsonError(400, "Missing required query param: collection");
+  if (!isValidAddress(collection)) return jsonError(400, "Invalid collection address");
+  if (!buyer) return jsonError(400, "Missing required query param: buyer");
+  if (!isValidAddress(buyer)) return jsonError(400, "Invalid buyer address");
+
+  const tipRecipientRaw = params.get("tipRecipient");
+  const tipBpsRaw = params.get("tipBps");
+  if ((tipRecipientRaw && !tipBpsRaw) || (!tipRecipientRaw && tipBpsRaw)) {
+    return jsonError(400, "tipRecipient and tipBps must be provided together");
+  }
+  const hasTip = !!(tipRecipientRaw && tipBpsRaw);
+  if (tipRecipientRaw && !isValidAddress(tipRecipientRaw)) {
+    return jsonError(400, "Invalid tipRecipient address");
+  }
+  const tipBps = hasTip ? Number(tipBpsRaw) : 0;
+  if (hasTip && (!Number.isFinite(tipBps) || tipBps <= 0 || tipBps > 10000)) {
+    return jsonError(400, "tipBps must be between 1 and 10000");
+  }
+
+  const chainId = Number(chainIdRaw);
+  const sql = getPooledSqlClient(ctx.env);
+  const now = Math.floor(Date.now() / 1000);
+
+  let rows: any[];
+  try {
+    if (tokenId) {
+      rows = await sql`
+        SELECT * FROM seaport_orders
+        WHERE chain_id = ${chainId}
+          AND nft_contract = ${collection}
+          AND token_id = ${tokenId}
+          AND order_type = 'listing'
+          AND status = 'active'
+          AND end_time > ${now}
+          AND offerer != ${buyer}
+        ORDER BY CAST(price_wei AS NUMERIC) ASC
+        LIMIT 1
+      `;
+    } else {
+      rows = await sql`
+        SELECT * FROM seaport_orders
+        WHERE chain_id = ${chainId}
+          AND nft_contract = ${collection}
+          AND order_type = 'listing'
+          AND status = 'active'
+          AND end_time > ${now}
+          AND offerer != ${buyer}
+        ORDER BY CAST(price_wei AS NUMERIC) ASC
+        LIMIT 1
+      `;
+    }
+  } catch (err: any) {
+    console.error("[oob-api] best-listing/fill-tx: DB error:", err);
+    return jsonError(500, "Failed to fetch best listing");
+  }
+
+  if (rows.length === 0) {
+    return jsonError(404, {
+      code: "NO_LISTING_FOUND",
+      message: tokenId
+        ? `No active listing found for token ${tokenId} in collection ${collection}`
+        : `No active listings found for collection ${collection}`,
+      collection,
+      ...(tokenId ? { tokenId } : {}),
+    });
+  }
+
+  const row = rows[0];
+  const orderJson = typeof row.order_json === "string"
+    ? JSON.parse(row.order_json)
+    : row.order_json;
+  const signature = row.signature as string;
+
+  const isNativePayment = row.currency === "0x0000000000000000000000000000000000000000";
+  let valueWei = 0n;
+  if (isNativePayment) {
+    for (const item of (orderJson.consideration || [])) {
+      if (Number(item.itemType) === 0) valueWei += BigInt(item.startAmount);
+    }
+  }
+
+  let calldata: string;
+  try {
+    if (hasTip) {
+      const tipAmount = (BigInt(row.price_wei) * BigInt(tipBps)) / 10000n;
+      if (tipAmount <= 0n) return jsonError(400, "Tip amount rounds to zero — increase tipBps");
+      const tipItemType = isNativePayment ? 0 : 1;
+      const tipToken = isNativePayment ? "0x0000000000000000000000000000000000000000" : row.currency;
+      if (isNativePayment) valueWei += tipAmount;
+      calldata = encodeFulfillAdvancedOrder(orderJson, signature, tipItemType, tipToken, tipAmount, tipRecipientRaw!);
+    } else {
+      calldata = encodeFulfillOrder(orderJson, signature);
+    }
+  } catch (err: any) {
+    console.error("[oob-api] best-listing/fill-tx: encoding error:", err);
+    return jsonError(500, {
+      code: "CALLDATA_ENCODING_FAILED",
+      message: "Failed to encode Seaport transaction calldata. The stored order data may be malformed.",
+      orderHash: row.order_hash,
+      detail: err?.message ?? "Unknown encoding error",
+    });
+  }
+
+  const cm = resolveCurrency(row.chain_id, row.currency);
+
+  return jsonResponse({
+    to: SEAPORT_ADDRESS,
+    data: calldata,
+    value: valueWei.toString(),
+    chainId: row.chain_id,
+    orderHash: row.order_hash,
+    orderType: row.order_type,
+    nftContract: row.nft_contract,
+    tokenId: row.token_id,
+    tokenStandard: row.token_standard,
+    offerer: row.offerer,
+    currency: row.currency,
+    currencySymbol: cm.currencySymbol,
+    currencyDecimals: cm.currencyDecimals,
+    priceWei: row.price_wei,
+    priceDecimal: formatPriceDecimal(row.price_wei, cm.currencyDecimals),
+    expiresAt: Number(row.end_time),
+    expiresInSeconds: Number(row.end_time) - now,
+    ...(Number(row.end_time) - now < 300 ? { warning: "This listing expires in less than 5 minutes. Broadcast quickly." } : {}),
+    ...(hasTip ? { tipBps, tipRecipient: tipRecipientRaw } : {}),
+  });
+}
+
+// ─── GET /v1/erc20/:token/approve-tx ────────────────────────────────────────
+//
+// Returns ready-to-sign ERC20 approval calldata for Seaport.
+// Agents paying with WETH (or any ERC20) must approve Seaport before filling.
+// This endpoint removes the need to know the ERC20 ABI.
+//
+// Path param:  :token  — ERC20 contract address
+// Query params:
+//   - spender (optional): defaults to Seaport address
+//   - amount  (optional): approval amount in wei, defaults to MaxUint256
+//
+// Response:
+//   { to, data, value, spender, amount, token }
+
+const ERC20_APPROVE_SIG = "approve(address,uint256)";
+const MAX_UINT256 = (2n ** 256n - 1n).toString();
+
+export async function handleErc20ApproveTx(ctx: RouteContext): Promise<Response> {
+  const token = ctx.segments[2]?.toLowerCase();
+  if (!token || !isValidAddress(token)) {
+    return jsonError(400, "Invalid or missing ERC20 token address in path");
+  }
+
+  const spender = (ctx.params.get("spender") ?? SEAPORT_ADDRESS).toLowerCase();
+  if (!isValidAddress(spender)) return jsonError(400, "Invalid spender address");
+
+  const amountRaw = ctx.params.get("amount") ?? MAX_UINT256;
+  let amount: bigint;
+  try {
+    amount = BigInt(amountRaw);
+    if (amount < 0n) throw new Error("negative");
+  } catch {
+    return jsonError(400, "Invalid amount — must be a non-negative integer string (wei)");
+  }
+
+  let calldata: string;
+  try {
+    const iface = new ethers.Interface([`function ${ERC20_APPROVE_SIG}`]);
+    calldata = iface.encodeFunctionData("approve", [spender, amount]);
+  } catch (err: any) {
+    console.error("[oob-api] erc20/approve-tx: encoding error:", err);
+    return jsonError(500, {
+      code: "CALLDATA_ENCODING_FAILED",
+      message: "Failed to encode ERC20 approve calldata.",
+      detail: err?.message ?? "Unknown encoding error",
+    });
+  }
+
+  return jsonResponse({
+    to: token,
+    data: calldata,
+    value: "0",
+    token,
+    spender,
+    amount: amount.toString(),
+    isMaxApproval: amount === BigInt(MAX_UINT256),
+    note: spender === SEAPORT_ADDRESS.toLowerCase()
+      ? "This approves Seaport to spend your ERC20 tokens (e.g. WETH) when filling orders."
+      : `This approves ${spender} to spend your ERC20 tokens.`,
+  });
+}
+
 // ─── DELETE /v1/orders/batch ────────────────────────────────────────────────
 
 interface BatchCancelInput {
@@ -1378,7 +2151,7 @@ async function processSingleOrderCancel(
 ): Promise<BatchCancelResult> {
   const { orderHash, signature: cancelSig } = item;
 
-  if (!orderHash || !HEX_STRING_RE.test(orderHash)) {
+  if (!orderHash || !ORDER_HASH_RE.test(orderHash)) {
     return { orderHash: orderHash || "", status: "error", error: "Invalid order hash" };
   }
 

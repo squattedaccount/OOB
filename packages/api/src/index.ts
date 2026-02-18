@@ -9,11 +9,15 @@
  *   GET    /v1/orders/best-listing       — Cheapest active listing
  *   GET    /v1/orders/best-offer         — Highest active offer
  *   GET    /v1/orders/:hash              — Get single order by hash
+ *   GET    /v1/orders/:hash/fill-tx      — Ready-to-sign fill transaction
  *   POST   /v1/orders                    — Submit a signed order
  *   POST   /v1/orders/batch             — Batch submit up to 20 orders
+ *   POST   /v1/orders/batch/fill-tx     — Batch fill-tx (sweep up to 20 orders)
  *   DELETE  /v1/orders/:hash             — Cancel an order
  *   DELETE  /v1/orders/batch             — Batch cancel up to 20 orders
+ *   GET    /v1/orders/best-listing/fill-tx — Floor snipe shortcut
  *   GET    /v1/collections/:addr/stats   — Collection floor, offer count, etc.
+ *   GET    /v1/erc20/:token/approve-tx   — ERC20 approval calldata for Seaport
  *   GET    /v1/config                    — Protocol fee config (for SDK)
  *   GET    /health                       — Health check
  */
@@ -33,6 +37,10 @@ import {
   handleBatchCancelOrders,
   handleCollectionStats,
   handleGetActivity,
+  handleFillTx,
+  handleBatchFillTx,
+  handleBestListingFillTx,
+  handleErc20ApproveTx,
 } from "./routes/orders.js";
 
 export { OrderStreamDO } from "./stream.js";
@@ -82,11 +90,16 @@ async function handleStreamUpgrade(
   env: Env,
   params: URLSearchParams,
 ): Promise<Response> {
+  // Apply rate limiting to websocket upgrades as well.
+  // Treat as write-tier to keep connection floods tightly constrained.
+  const rateLimitResponse = await checkRateLimit(request, env, true);
+  if (rateLimitResponse) return rateLimitResponse;
+
   if (!env.ORDER_STREAM) {
     return jsonError(503, "WebSocket streams not configured");
   }
 
-  const upgradeHeader = request.headers.get("Upgrade");
+  const upgradeHeader = request.headers.get("Upgrade")?.toLowerCase();
   if (upgradeHeader !== "websocket") {
     return jsonError(426, "Expected WebSocket upgrade");
   }
@@ -145,6 +158,11 @@ async function route(
   // ─── /v1/orders ─────────────────────────────────────────────────────
 
   if (resource === "orders") {
+    // POST /v1/orders/batch/fill-tx (sweep)
+    if (segments[2] === "batch" && segments[3] === "fill-tx" && method === "POST") {
+      return handleBatchFillTx(ctx);
+    }
+
     // POST /v1/orders/batch (batch submit)
     if (segments[2] === "batch" && method === "POST") {
       return handleBatchSubmitOrders(ctx);
@@ -153,6 +171,11 @@ async function route(
     // DELETE /v1/orders/batch (batch cancel)
     if (segments[2] === "batch" && method === "DELETE") {
       return handleBatchCancelOrders(ctx);
+    }
+
+    // GET /v1/orders/best-listing/fill-tx (floor snipe shortcut)
+    if (segments[2] === "best-listing" && segments[3] === "fill-tx" && method === "GET") {
+      return handleBestListingFillTx(ctx);
     }
 
     // GET /v1/orders/best-listing
@@ -170,6 +193,11 @@ async function route(
       // Rewrite as /v1/activity?orderHash=:hash for convenience
       ctx.params.set("orderHash", segments[2]);
       return handleGetActivity(ctx);
+    }
+
+    // GET /v1/orders/:hash/fill-tx
+    if (segments[2] && segments[3] === "fill-tx" && segments.length === 4 && method === "GET") {
+      return handleFillTx(ctx);
     }
 
     // GET /v1/orders/:hash (must be a hash, not a sub-route)
@@ -209,6 +237,12 @@ async function route(
       protocolFeeBps: Number(ctx.env.PROTOCOL_FEE_BPS || "50"),
       protocolFeeRecipient: ctx.env.PROTOCOL_FEE_RECIPIENT || "",
     });
+  }
+
+  // ─── /v1/erc20/:token/approve-tx ──────────────────────────────────────
+
+  if (resource === "erc20" && segments[3] === "approve-tx" && method === "GET") {
+    return handleErc20ApproveTx(ctx);
   }
 
   // ─── /v1/collections/:address/stats ─────────────────────────────────

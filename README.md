@@ -78,12 +78,18 @@ const floor = await oob.getBestListing({
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/v1/orders` | Query orders with filters |
+| GET | `/v1/orders` | Query orders with filters (`tokenIds=1,2,3` supported) |
 | GET | `/v1/orders/:hash` | Get single order by hash |
+| GET | `/v1/orders/:hash/fill-tx` | Ready-to-sign fill transaction (for agents/bots) |
+| POST | `/v1/orders/batch/fill-tx` | Batch fill-tx — sweep up to 20 listings at once |
 | GET | `/v1/orders/best-listing` | Floor price for collection/token |
+| GET | `/v1/orders/best-listing/fill-tx` | Floor snipe — best listing + fill-tx in one call |
 | GET | `/v1/orders/best-offer` | Best offer for collection/token |
 | POST | `/v1/orders` | Submit a signed Seaport order |
-| DELETE | `/v1/orders/:hash` | Cancel order (requires txHash) |
+| POST | `/v1/orders/batch` | Batch submit up to 20 orders |
+| DELETE | `/v1/orders/:hash` | Cancel order |
+| DELETE | `/v1/orders/batch` | Batch cancel up to 20 orders |
+| GET | `/v1/erc20/:token/approve-tx` | ERC20 approval calldata for Seaport (for agents) |
 | GET | `/v1/collections/:addr/stats` | Collection stats |
 | WS | `/v1/stream` | Real-time order events |
 
