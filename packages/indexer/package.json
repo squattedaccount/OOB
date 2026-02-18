@@ -6,16 +6,18 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "tail": "wrangler tail"
+    "tail": "wrangler tail",
+    "sync-goldsky": "npx tsx scripts/sync-goldsky-pipelines.ts",
+    "sync-goldsky:dry": "npx tsx scripts/sync-goldsky-pipelines.ts --dry-run",
+    "sync-goldsky:watch": "npx tsx scripts/watch-goldsky-sync.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",
-    "ethers": "^6.16.0",
-    "solc": "^0.8.28"
+    "ethers": "^6.16.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241205.0",
     "typescript": "^5.7.2",
-    "wrangler": "^3.99.0"
+    "wrangler": "^4.58.0"
   }
 }

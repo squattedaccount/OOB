@@ -223,7 +223,7 @@ describe("ApiClient", () => {
 
     it("OobApiError includes status code", async () => {
       mockFetch.mockResolvedValue(
-        new Response(JSON.stringify({ error: "Rate limited" }), { status: 429 }),
+        new Response(JSON.stringify({ error: "Forbidden" }), { status: 403 }),
       );
 
       try {
@@ -231,7 +231,7 @@ describe("ApiClient", () => {
         expect.unreachable("Should have thrown");
       } catch (err) {
         expect(err).toBeInstanceOf(OobApiError);
-        expect((err as OobApiError).status).toBe(429);
+        expect((err as OobApiError).status).toBe(403);
       }
     });
 
@@ -240,8 +240,9 @@ describe("ApiClient", () => {
         new Response("Internal Server Error", { status: 500 }),
       );
 
+      // Retries 3 times with backoff before throwing
       await expect(api.getOrders()).rejects.toThrow(OobApiError);
-    });
+    }, 15000);
   });
 
   describe("Custom API URL", () => {

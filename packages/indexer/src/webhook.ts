@@ -15,6 +15,7 @@ import type { Env, SeaportLifecycleEvent, WebhookLogEntry, ProcessingResult } fr
 import type { SqlClient } from "./db.js";
 import { decodeSeaportEvent, isSeaportLog } from "./seaport.js";
 import { processLifecycleEvents } from "./lifecycle.js";
+import { extractTransferEvents, processTransferEvents } from "./transfer.js";
 
 // ─── Payload Normalization ──────────────────────────────────────────────────
 
@@ -174,7 +175,7 @@ async function verifyWebhook(
   rawBody?: string,
 ): Promise<boolean> {
   if (!env.WEBHOOK_SECRET) {
-    console.warn("[oob-indexer] WEBHOOK_SECRET not configured — rejecting webhook. Set it with: wrangler secret put WEBHOOK_SECRET");
+    console.error("[oob-indexer] CRITICAL: WEBHOOK_SECRET not configured — ALL webhooks rejected! Set with: wrangler secret put WEBHOOK_SECRET");
     return false;
   }
 
@@ -347,7 +348,7 @@ export async function handleWebhook(
 
   // Opportunistic cleanup (~1% of requests)
   if (Math.random() < 0.01) {
-    cleanupDedup(sql).catch(() => {});
+    cleanupDedup(sql).catch(() => { });
   }
 
   // Moralis sends unconfirmed events first — skip them
@@ -376,7 +377,10 @@ export async function handleWebhook(
     if (evt) events.push(evt);
   }
 
-  // Process events
+  // Decode ERC-721 Transfer events for stale listing detection
+  const transferEvents = extractTransferEvents(logs, chainId);
+
+  // Process Seaport lifecycle events
   const result: ProcessingResult = {
     received: logs.length,
     processed: events.length,
@@ -396,9 +400,20 @@ export async function handleWebhook(
 
     console.log(
       `[oob-indexer] Webhook: received=${result.received} seaport=${result.processed} ` +
-        `fulfilled=${result.fulfilled} cancelled=${result.cancelled} ` +
-        `counterIncr=${result.counterIncremented} dbUpdated=${updated}`,
+      `fulfilled=${result.fulfilled} cancelled=${result.cancelled} ` +
+      `counterIncr=${result.counterIncremented} dbUpdated=${updated}`,
     );
+  }
+
+  // Process Transfer events (stale detection).
+  // Awaited directly — Cloudflare Workers kill unawaited promises after response.
+  // The DB query is a fast indexed point lookup so latency impact is negligible.
+  if (transferEvents.length > 0) {
+    try {
+      await processTransferEvents(sql, transferEvents);
+    } catch (err) {
+      console.error("[oob-indexer] Transfer stale processing error:", err);
+    }
   }
 
   return new Response(JSON.stringify({ success: true, ...result }), {

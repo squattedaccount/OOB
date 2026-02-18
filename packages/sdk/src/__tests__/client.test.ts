@@ -154,7 +154,7 @@ describe("OpenOrderBook", () => {
     it("createListing throws without wallet", async () => {
       await expect(
         oob.createListing({
-          collection: "0xnft",
+          collection: "0x1234567890123456789012345678901234567890",
           tokenId: "1",
           priceWei: "1000000000000000000",
         }),
@@ -164,10 +164,10 @@ describe("OpenOrderBook", () => {
     it("createOffer throws without wallet", async () => {
       await expect(
         oob.createOffer({
-          collection: "0xnft",
+          collection: "0x1234567890123456789012345678901234567890",
           tokenId: "1",
           amountWei: "500000000000000000",
-          currency: "0xweth",
+          currency: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
         }),
       ).rejects.toThrow("Wallet not connected");
     });

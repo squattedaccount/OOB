@@ -1,0 +1,411 @@
+#!/usr/bin/env npx tsx
+/**
+ * OOB Indexer — Goldsky Transfer Pipeline Sync
+ *
+ * Queries Neon for all collections that currently have active listings,
+ * generates Goldsky Mirror pipeline YAML configs (one per chain), and
+ * applies them via `goldsky pipeline apply` so Transfer events are streamed
+ * to the OOB indexer webhook for instant stale detection.
+ *
+ * The pipeline is UPSERTED — running this script again after new collections
+ * are listed simply updates the address filter in-place without downtime.
+ *
+ * Prerequisites:
+ *   1. Install Goldsky CLI:  curl https://goldsky.com/install | sh
+ *   2. Authenticate:         goldsky login
+ *   3. Create webhook secret: goldsky secret create
+ *      (type: httpauth, header: x-goldsky-secret, value: your WEBHOOK_SECRET)
+ *      Note the secret name — set it as GOLDSKY_SECRET_NAME below or env var.
+ *
+ * Usage:
+ *   DATABASE_URL=... npx tsx scripts/sync-goldsky-pipelines.ts
+ *   DATABASE_URL=... npx tsx scripts/sync-goldsky-pipelines.ts --dry-run
+ *   DATABASE_URL=... npx tsx scripts/sync-goldsky-pipelines.ts --list
+ *
+ * Automation (run after every deploy, or on a schedule):
+ *   Add to your CI/CD pipeline or a GitHub Actions cron job.
+ */
+
+import { execSync } from "node:child_process";
+import { writeFileSync, unlinkSync, existsSync, readFileSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { neon } from "@neondatabase/serverless";
+
+// ─── Configuration ──────────────────────────────────────────────────────────
+
+const DATABASE_URL = process.env.DATABASE_URL;
+const INDEXER_URL =
+  process.env.OOB_INDEXER_URL || "https://oob-indexer.sm-p.workers.dev";
+const WEBHOOK_PATH = process.env.OOB_WEBHOOK_PATH || "/webhook/goldsky";
+
+// Name of the Goldsky httpauth secret that holds your WEBHOOK_SECRET.
+// Create it once with: goldsky secret create
+// (choose type: httpauth, header name: x-goldsky-secret, value: your WEBHOOK_SECRET)
+const GOLDSKY_SECRET_NAME =
+  process.env.GOLDSKY_SECRET_NAME || "OOB_WEBHOOK_SECRET";
+
+// Pipeline name prefix — one pipeline per chain, e.g. "oob-transfers-base"
+const PIPELINE_PREFIX = "oob-transfers";
+
+// ERC-721 Transfer(address indexed from, address indexed to, uint256 indexed tokenId)
+const TRANSFER_TOPIC =
+  "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+// Goldsky dataset names per chain ID
+// See: https://docs.goldsky.com/mirror/sources/supported-networks
+const CHAIN_DATASET: Record<number, string> = {
+  1: "ethereum.logs",
+  8453: "base.logs",
+  84532: "base_sepolia.logs",
+  2741: "abstract.logs",
+  // Hyperliquid and Ronin are not yet in Goldsky's dataset catalog.
+  // Add them here when Goldsky adds support.
+};
+
+const CHAIN_NAMES: Record<number, string> = {
+  1: "ethereum",
+  8453: "base",
+  84532: "base-sepolia",
+  2741: "abstract",
+};
+
+// ─── DB Query ───────────────────────────────────────────────────────────────
+
+interface CollectionRow {
+  chain_id: number;
+  nft_contract: string;
+}
+
+async function getActiveCollections(): Promise<CollectionRow[]> {
+  if (!DATABASE_URL) {
+    console.error("❌ DATABASE_URL environment variable is required");
+    process.exit(1);
+  }
+
+  const sql = neon(DATABASE_URL);
+  const rows = await sql`
+    SELECT DISTINCT chain_id, nft_contract
+    FROM seaport_orders
+    WHERE status = 'active'
+      AND order_type = 'listing'
+      AND token_standard = 'ERC721'
+    ORDER BY chain_id, nft_contract
+  `;
+  return (Array.isArray(rows) ? rows : []) as CollectionRow[];
+}
+
+// ─── YAML Generation ────────────────────────────────────────────────────────
+
+/**
+ * Generate a Goldsky Mirror pipeline YAML for a single chain.
+ *
+ * The pipeline:
+ *   source  → chain.logs dataset (raw EVM logs)
+ *   transform → SQL filter: only Transfer events from our collections
+ *   sink    → webhook POST to our indexer
+ *
+ * When applied to an existing pipeline, Goldsky updates the filter in-place
+ * using --from-snapshot last, so no historical events are re-delivered.
+ */
+function generatePipelineYaml(
+  chainId: number,
+  chainName: string,
+  datasetName: string,
+  collections: string[],
+  webhookUrl: string,
+  secretName: string,
+): string {
+  const pipelineName = `${PIPELINE_PREFIX}-${chainName}`;
+  const sourceName = `${chainName}_logs`;
+  const transformName = `transfer_filter`;
+
+  // SQL filter: only Transfer events from our known collections.
+  // Goldsky SQL runs against the raw logs dataset — columns: address, topics, data,
+  // transaction_hash, block_number, block_timestamp, log_index, id
+  //
+  // topics is an array; topics[0] is the event signature.
+  // We filter by topic[0] = Transfer AND address IN (our collections).
+  const addressList = collections
+    .map((a) => `'${a.toLowerCase()}'`)
+    .join(",\n          ");
+
+  const yaml = `name: ${pipelineName}
+description: OOB Transfer event pipeline for ${chainName} — auto-generated by sync-goldsky-pipelines.ts
+apiVersion: 3
+
+sources:
+  ${sourceName}:
+    dataset_name: ${datasetName}
+    version: 1.0.0
+    type: dataset
+    start_at: latest
+
+transforms:
+  ${transformName}:
+    primary_key: id
+    sql: |
+      SELECT
+        id,
+        address,
+        topics,
+        data,
+        transaction_hash,
+        block_number,
+        block_timestamp,
+        log_index
+      FROM ${sourceName}
+      WHERE topics[1] = '${TRANSFER_TOPIC}'
+        AND lower(address) IN (
+          ${addressList}
+        )
+
+sinks:
+  oob_webhook:
+    type: webhook
+    from: ${transformName}
+    url: ${webhookUrl}
+    secret_name: ${secretName}
+    batch_size: 100
+    batch_flush_interval: 1s
+`;
+
+  return yaml;
+}
+
+// ─── Goldsky CLI Helpers ─────────────────────────────────────────────────────
+
+function goldskyAvailable(): boolean {
+  try {
+    execSync("goldsky --version", { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function applyPipeline(yamlPath: string, pipelineName: string): void {
+  // --from-snapshot last: resume from where the pipeline left off (no re-delivery)
+  // --status ACTIVE: keep/start the pipeline running after apply
+  const cmd = `goldsky pipeline apply ${yamlPath} --from-snapshot last --status ACTIVE`;
+  console.log(`  Running: ${cmd}`);
+  execSync(cmd, { stdio: "inherit" });
+}
+
+function normalizeBaseUrl(url: string): string {
+  return url.replace(/\/+$/, "");
+}
+
+function listPipelines(): void {
+  execSync(`goldsky pipeline list`, { stdio: "inherit" });
+}
+
+function parseArgValue(args: string[], name: string): string | null {
+  const exact = `${name}=`;
+  const inline = args.find((a) => a.startsWith(exact));
+  if (inline) return inline.slice(exact.length);
+  const idx = args.indexOf(name);
+  if (idx >= 0 && idx + 1 < args.length) return args[idx + 1];
+  return null;
+}
+
+function computeCollectionsSignature(rows: CollectionRow[]): string {
+  const normalized = rows
+    .map((r) => `${r.chain_id}:${r.nft_contract.toLowerCase()}`)
+    .sort()
+    .join("|");
+  return normalized;
+}
+
+function readStateFile(path: string): string {
+  if (!existsSync(path)) return "";
+  try {
+    return readFileSync(path, "utf-8").trim();
+  } catch {
+    return "";
+  }
+}
+
+function writeStateFile(path: string, signature: string): void {
+  const dir = dirname(path);
+  if (!existsSync(dir)) {
+    mkdirSync(dir, { recursive: true });
+  }
+  writeFileSync(path, signature + "\n", "utf-8");
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  const isDryRun = args.includes("--dry-run");
+  const isList = args.includes("--list");
+  const isStrict = args.includes("--strict");
+  const isForce = args.includes("--force");
+  const stateFileArg = parseArgValue(args, "--state-file");
+  const stateFilePath =
+    stateFileArg || process.env.GOLDSKY_SYNC_STATE_FILE || "";
+
+  console.log("=== OOB Indexer — Goldsky Transfer Pipeline Sync ===\n");
+  console.log(`Indexer URL:    ${INDEXER_URL}`);
+  console.log(`Webhook path:   ${WEBHOOK_PATH}`);
+  console.log(`Secret name:    ${GOLDSKY_SECRET_NAME}`);
+  console.log(`Pipeline prefix: ${PIPELINE_PREFIX}-<chain>\n`);
+  if (stateFilePath) {
+    console.log(`State file:     ${stateFilePath}`);
+  }
+
+  if (isList) {
+    if (!goldskyAvailable()) {
+      console.error("❌ goldsky CLI not found. Install: curl https://goldsky.com/install | sh");
+      process.exit(1);
+    }
+    console.log("📋 Current Goldsky pipelines:\n");
+    listPipelines();
+    return;
+  }
+
+  // Fetch active collections from DB
+  console.log("🔍 Querying active collections from Neon...");
+  const collections = await getActiveCollections();
+
+  const currentSignature = computeCollectionsSignature(collections);
+  if (stateFilePath && !isForce) {
+    const previousSignature = readStateFile(stateFilePath);
+    if (previousSignature === currentSignature) {
+      console.log("  No collection-set changes since last sync (state file match). Skipping apply.");
+      return;
+    }
+  }
+
+  if (collections.length === 0) {
+    console.log("  No active ERC-721 listings found. Nothing to sync.");
+    return;
+  }
+
+  console.log(`  Found ${collections.length} active collection(s) across chains.\n`);
+
+  // Group by chain
+  const byChain = new Map<number, string[]>();
+  for (const row of collections) {
+    const group = byChain.get(row.chain_id) ?? [];
+    group.push(row.nft_contract);
+    byChain.set(row.chain_id, group);
+  }
+
+  // Check Goldsky CLI availability (skip for dry-run)
+  if (!isDryRun && !goldskyAvailable()) {
+    console.error("❌ goldsky CLI not found.");
+    console.error("   Install: curl https://goldsky.com/install | sh");
+    console.error("   Then authenticate: goldsky login");
+    process.exit(1);
+  }
+
+  const webhookUrl = `${normalizeBaseUrl(INDEXER_URL)}${WEBHOOK_PATH.startsWith("/") ? WEBHOOK_PATH : `/${WEBHOOK_PATH}`}`;
+  const tmpFiles: string[] = [];
+  let appliedCount = 0;
+  let failedCount = 0;
+  let skippedUnsupportedCount = 0;
+  const failedPipelines: string[] = [];
+  const unsupportedChains: number[] = [];
+
+  try {
+    for (const [chainId, addresses] of byChain) {
+      const datasetName = CHAIN_DATASET[chainId];
+      const chainName = CHAIN_NAMES[chainId];
+
+      if (!datasetName || !chainName) {
+        skippedUnsupportedCount += 1;
+        unsupportedChains.push(chainId);
+        console.warn(
+          `  ⚠️  Chain ${chainId} not in Goldsky dataset catalog — skipping.`,
+          `(${addresses.length} collection(s) on this chain will use Multicall3 cron only)`,
+        );
+        continue;
+      }
+
+      const pipelineName = `${PIPELINE_PREFIX}-${chainName}`;
+      console.log(`📦 Chain ${chainId} (${chainName}): ${addresses.length} collection(s)`);
+      for (const addr of addresses) {
+        console.log(`     ${addr}`);
+      }
+
+      const yaml = generatePipelineYaml(
+        chainId,
+        chainName,
+        datasetName,
+        addresses,
+        webhookUrl,
+        GOLDSKY_SECRET_NAME,
+      );
+
+      if (isDryRun) {
+        console.log(`\n--- YAML for ${pipelineName} (dry-run, not applied) ---`);
+        console.log(yaml);
+        console.log("---\n");
+        continue;
+      }
+
+      // Write YAML to a temp file and apply
+      const tmpPath = join(tmpdir(), `${pipelineName}-${Date.now()}.yaml`);
+      tmpFiles.push(tmpPath);
+      writeFileSync(tmpPath, yaml, "utf-8");
+
+      console.log(`  Applying pipeline: ${pipelineName}...`);
+      try {
+        applyPipeline(tmpPath, pipelineName);
+        appliedCount += 1;
+        console.log(`  ✅ ${pipelineName} applied successfully\n`);
+      } catch (err) {
+        failedCount += 1;
+        failedPipelines.push(pipelineName);
+        console.error(`  ❌ Failed to apply ${pipelineName}:`, err);
+      }
+    }
+  } finally {
+    // Clean up temp files
+    for (const f of tmpFiles) {
+      if (existsSync(f)) unlinkSync(f);
+    }
+  }
+
+  if (!isDryRun) {
+    console.log("=== Sync complete ===");
+    console.log(`Applied pipelines:         ${appliedCount}`);
+    console.log(`Failed pipelines:          ${failedCount}`);
+    console.log(`Unsupported chains skipped:${skippedUnsupportedCount}`);
+
+    if (failedPipelines.length > 0) {
+      console.log(`Failed: ${failedPipelines.join(", ")}`);
+    }
+    if (unsupportedChains.length > 0) {
+      console.log(`Unsupported chain IDs: ${unsupportedChains.join(", ")}`);
+    }
+
+    if (failedCount > 0) {
+      console.error("\n❌ Sync finished with pipeline apply failures.");
+      process.exit(1);
+    }
+
+    if (isStrict && skippedUnsupportedCount > 0) {
+      console.error("\n❌ Strict mode enabled and unsupported chains were skipped.");
+      process.exit(1);
+    }
+
+    if (stateFilePath) {
+      writeStateFile(stateFilePath, currentSignature);
+      console.log(`Saved state signature to: ${stateFilePath}`);
+    }
+
+    console.log("\nNext steps:");
+    console.log("  • Monitor pipelines: goldsky pipeline monitor oob-transfers-base");
+    console.log("  • View all pipelines: goldsky pipeline list");
+    console.log("  • Re-run this script whenever new collections go live");
+    console.log("\nTo automate: add this script to your CI/CD deploy step or a GitHub Actions cron.");
+  }
+}
+
+main().catch((err) => {
+  console.error("Fatal:", err);
+  process.exit(1);
+});

@@ -5,11 +5,14 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Max-Age": "86400",
 };
 
+export const API_VERSION = "2026-02-17";
+
 export function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       "Content-Type": "application/json",
+      "X-API-Version": API_VERSION,
       ...CORS_HEADERS,
     },
   });

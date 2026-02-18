@@ -29,6 +29,26 @@ import type {
 } from "./types.js";
 import { DEFAULT_API_URL, DEFAULT_FEE_BPS, DEFAULT_FEE_RECIPIENT } from "./types.js";
 
+// ─── Input Validation ─────────────────────────────────────────────────────
+
+const ETH_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+function validateAddress(value: string, label: string): void {
+  if (!ETH_ADDRESS_RE.test(value)) {
+    throw new Error(`Invalid ${label}: "${value}" is not a valid Ethereum address`);
+  }
+}
+
+function validatePositiveBigInt(value: string | bigint, label: string): void {
+  try {
+    const n = BigInt(value);
+    if (n <= 0n) throw new Error(`${label} must be greater than zero`);
+  } catch (e: any) {
+    if (e.message?.includes("must be greater")) throw e;
+    throw new Error(`Invalid ${label}: cannot parse "${value}" as a number`);
+  }
+}
+
 export class OpenOrderBook {
   readonly config: Required<OobConfig>;
   readonly api: ApiClient;
@@ -133,15 +153,17 @@ export class OpenOrderBook {
    * Convenience wrapper around getOrders().
    */
   async getListings(
-    collection: string,
+    collectionOrParams: string | { collection: string; tokenId?: string; limit?: number; offset?: number },
     opts?: { tokenId?: string; limit?: number; offset?: number },
   ): Promise<OrdersResponse> {
+    const params = typeof collectionOrParams === "string"
+      ? { collection: collectionOrParams, ...opts }
+      : collectionOrParams;
     return this.api.getOrders({
-      collection,
+      ...params,
       type: "listing",
       status: "active",
       sortBy: "price_asc",
-      ...opts,
     });
   }
 
@@ -149,15 +171,17 @@ export class OpenOrderBook {
    * Get all active offers for a collection or token.
    */
   async getOffers(
-    collection: string,
+    collectionOrParams: string | { collection: string; tokenId?: string; limit?: number; offset?: number },
     opts?: { tokenId?: string; limit?: number; offset?: number },
   ): Promise<OrdersResponse> {
+    const params = typeof collectionOrParams === "string"
+      ? { collection: collectionOrParams, ...opts }
+      : collectionOrParams;
     return this.api.getOrders({
-      collection,
+      ...params,
       type: "offer",
       status: "active",
       sortBy: "price_desc",
-      ...opts,
     });
   }
 
@@ -185,6 +209,11 @@ export class OpenOrderBook {
    * console.log(result.orderHash);
    */
   async createListing(params: CreateListingParams): Promise<SubmitOrderResponse> {
+    validateAddress(params.collection, "collection");
+    validatePositiveBigInt(params.priceWei, "priceWei");
+    if (params.currency) validateAddress(params.currency, "currency");
+    if (params.royaltyRecipient) validateAddress(params.royaltyRecipient, "royaltyRecipient");
+
     const { wallet, public: pub } = this.requireWallet();
 
     // Check approval first
@@ -222,6 +251,11 @@ export class OpenOrderBook {
    * });
    */
   async createOffer(params: CreateOfferParams): Promise<SubmitOrderResponse> {
+    validateAddress(params.collection, "collection");
+    validateAddress(params.currency, "currency");
+    validatePositiveBigInt(params.amountWei, "amountWei");
+    if (params.royaltyRecipient) validateAddress(params.royaltyRecipient, "royaltyRecipient");
+
     const { wallet, public: pub } = this.requireWallet();
 
     // Check ERC20 readiness

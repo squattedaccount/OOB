@@ -164,6 +164,10 @@ export interface CreateListingParams {
   royaltyBps?: number;
   /** Royalty recipient address */
   royaltyRecipient?: string;
+  /** Token standard: "ERC721" or "ERC1155". Defaults to "ERC721". */
+  tokenStandard?: "ERC721" | "ERC1155";
+  /** Quantity for ERC1155 tokens. Defaults to 1. */
+  quantity?: string | bigint;
 }
 
 export interface CreateOfferParams {
@@ -181,6 +185,10 @@ export interface CreateOfferParams {
   royaltyBps?: number;
   /** Royalty recipient address */
   royaltyRecipient?: string;
+  /** Token standard: "ERC721" or "ERC1155". Defaults to "ERC721". */
+  tokenStandard?: "ERC721" | "ERC1155";
+  /** Quantity for ERC1155 tokens. Defaults to 1. */
+  quantity?: string | bigint;
 }
 
 export interface FillOrderParams {

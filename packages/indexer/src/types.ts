@@ -55,3 +55,13 @@ export interface CronResult {
   staleDetected: number;
   errors: string[];
 }
+
+export interface TransferEvent {
+  chainId: number;
+  nftContract: string;  // lowercase
+  tokenId: string;
+  from: string;         // lowercase — the address that sent the token
+  to: string;           // lowercase
+  txHash: string;
+  blockNumber: string | number;
+}

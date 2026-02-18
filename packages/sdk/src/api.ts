@@ -132,8 +132,36 @@ export class ApiClient {
     return h;
   }
 
+  private static MAX_RETRIES = 3;
+  private static RETRY_BASE_MS = 500;
+
+  /**
+   * Fetch with exponential backoff retry for 429 and 5xx errors.
+   */
+  private async fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt <= ApiClient.MAX_RETRIES; attempt++) {
+      try {
+        const res = await fetch(url, init);
+        if (res.status === 429 || (res.status >= 500 && attempt < ApiClient.MAX_RETRIES)) {
+          const delay = ApiClient.RETRY_BASE_MS * Math.pow(2, attempt);
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+        return res;
+      } catch (err) {
+        lastError = err as Error;
+        if (attempt < ApiClient.MAX_RETRIES) {
+          const delay = ApiClient.RETRY_BASE_MS * Math.pow(2, attempt);
+          await new Promise((r) => setTimeout(r, delay));
+        }
+      }
+    }
+    throw lastError ?? new Error("Request failed after retries");
+  }
+
   private async get<T>(path: string): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await this.fetchWithRetry(`${this.baseUrl}${path}`, {
       method: "GET",
       headers: this.headers(),
     });
@@ -141,7 +169,7 @@ export class ApiClient {
   }
 
   private async post<T>(path: string, body: unknown): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await this.fetchWithRetry(`${this.baseUrl}${path}`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(body),
@@ -150,7 +178,7 @@ export class ApiClient {
   }
 
   private async del<T>(path: string, body?: unknown): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await this.fetchWithRetry(`${this.baseUrl}${path}`, {
       method: "DELETE",
       headers: this.headers(),
       body: body ? JSON.stringify(body) : undefined,

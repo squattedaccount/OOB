@@ -37,10 +37,13 @@ export async function checkRateLimit(
   // Determine limit based on tier and request type
   const limit = getLimit(env, isRegistered, isWrite);
 
-  // Build KV key: ratelimit:{identifier}:{read|write}:{minute}
-  const minute = Math.floor(Date.now() / 60000);
+  // Build KV key with 15-second windows for tighter rate control.
+  // Smaller windows reduce the impact of KV's eventual consistency race conditions.
+  const window = Math.floor(Date.now() / 15000);
   const kind = isWrite ? "w" : "r";
-  const key = `rl:${identifier}:${kind}:${minute}`;
+  const key = `rl:${identifier}:${kind}:${window}`;
+  // Per-window limit is 1/4 of the per-minute limit (rounded up)
+  const windowLimit = Math.ceil(limit / 4);
 
   try {
     // Increment-first pattern: always increment, then check.
@@ -50,15 +53,15 @@ export async function checkRateLimit(
     const next = current + 1;
 
     // Write the incremented value immediately (before checking limit)
-    await kv.put(key, String(next), { expirationTtl: 120 });
+    await kv.put(key, String(next), { expirationTtl: 30 });
 
-    if (next > limit) {
-      const retryAfter = 60 - (Math.floor(Date.now() / 1000) % 60);
+    if (next > windowLimit) {
+      const retryAfter = 15 - (Math.floor(Date.now() / 1000) % 15);
       const res = jsonError(429, "Rate limit exceeded. Try again later.");
       res.headers.set("Retry-After", String(retryAfter));
       res.headers.set("X-RateLimit-Limit", String(limit));
       res.headers.set("X-RateLimit-Remaining", "0");
-      res.headers.set("X-RateLimit-Reset", String(Math.ceil(Date.now() / 60000) * 60));
+      res.headers.set("X-RateLimit-Reset", String(Math.ceil(Date.now() / 15000) * 15));
       return res;
     }
 
@@ -104,15 +107,16 @@ export async function addRateLimitHeaders(
   if (!identifier) return response;
 
   const limit = getLimit(env, isRegistered, isWrite);
-  const minute = Math.floor(Date.now() / 60000);
+  const window = Math.floor(Date.now() / 15000);
+  const windowLimit = Math.ceil(limit / 4);
   const kind = isWrite ? "w" : "r";
-  const key = `rl:${identifier}:${kind}:${minute}`;
+  const key = `rl:${identifier}:${kind}:${window}`;
 
   try {
     const current = Number(await kv.get(key) || "0");
     response.headers.set("X-RateLimit-Limit", String(limit));
-    response.headers.set("X-RateLimit-Remaining", String(Math.max(0, limit - current)));
-    response.headers.set("X-RateLimit-Reset", String(Math.ceil(Date.now() / 60000) * 60));
+    response.headers.set("X-RateLimit-Remaining", String(Math.max(0, windowLimit - current) * 4));
+    response.headers.set("X-RateLimit-Reset", String(Math.ceil(Date.now() / 15000) * 15));
   } catch {
     // Ignore errors in header decoration
   }

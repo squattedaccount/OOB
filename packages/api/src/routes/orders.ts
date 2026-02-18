@@ -4,10 +4,12 @@
 
 import type { RouteContext } from "../types.js";
 import type { SqlClient } from "../db.js";
-import { getSqlClient } from "../db.js";
+import { getPooledSqlClient } from "../db.js";
 import { jsonResponse, jsonError } from "../response.js";
 import { computeOrderHash } from "../seaportHash.js";
 import { logActivity } from "../activity.js";
+import { resolveCurrency, formatPriceDecimal } from "../currency.js";
+import { ethers } from "ethers";
 
 // ─── Validation Helpers ─────────────────────────────────────────────────────
 
@@ -27,6 +29,45 @@ function isValidChainId(raw: unknown): raw is number {
 }
 
 const MAX_BATCH_SIZE = 20;
+
+// ─── WebSocket Broadcast Helper ─────────────────────────────────────────────
+
+/**
+ * Broadcast an order event to WebSocket clients via the OrderStreamDO.
+ * Fire-and-forget: errors are logged but never block the response.
+ */
+async function broadcastOrderEvent(
+  env: import("../types.js").Env,
+  eventType: string,
+  order: { orderHash: string; chainId: number; nftContract: string; [k: string]: unknown },
+): Promise<void> {
+  try {
+    if (!env.ORDER_STREAM || !env.INTERNAL_SECRET) return;
+
+    const collection = (order.nftContract || "all").toLowerCase();
+    const roomId = `${order.chainId}:${collection}`;
+    const payload = JSON.stringify({ type: eventType, order, timestamp: Date.now() });
+    const headers = {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${env.INTERNAL_SECRET}`,
+    };
+
+    // Fan out to all shards. With DO_SHARD_COUNT=1 (default) this is a single broadcast.
+    const shardCount = Math.max(1, parseInt(env.DO_SHARD_COUNT || "1", 10));
+    const broadcasts: Promise<unknown>[] = [];
+    for (let shard = 0; shard < shardCount; shard++) {
+      const shardedRoomId = shardCount === 1 ? roomId : `${roomId}:s${shard}`;
+      const id = env.ORDER_STREAM.idFromName(shardedRoomId);
+      const stub = env.ORDER_STREAM.get(id);
+      broadcasts.push(
+        stub.fetch("https://internal/internal/broadcast", { method: "POST", headers, body: payload }),
+      );
+    }
+    await Promise.allSettled(broadcasts);
+  } catch (err) {
+    console.error("[oob-api] Broadcast failed (non-blocking):", err);
+  }
+}
 
 /**
  * Read request body as text with a hard byte-size limit.
@@ -65,6 +106,144 @@ function safeBigInt(val: unknown): bigint {
   } catch {
     return 0n;
   }
+}
+
+// ─── Shared Order Parsing ───────────────────────────────────────────────────
+
+interface ParsedOrderDetails {
+  orderType: "listing" | "offer";
+  nftContract: string;
+  tokenId: string;
+  tokenStandard: string;
+  priceWei: bigint;
+  currency: string;
+  feeRecipient: string;
+  feeBps: number;
+  royaltyRecipient: string;
+  royaltyBps: number;
+}
+
+/**
+ * Extract NFT, price, fee, and royalty details from a Seaport order.
+ * Shared between single-submit and batch-submit paths.
+ * Returns null with an error string if the order cannot be parsed.
+ */
+function parseOrderDetails(
+  order: any,
+  offerer: string,
+  protocolFeeRecipient: string,
+): { ok: true; parsed: ParsedOrderDetails } | { ok: false; error: string } {
+  const offerItems: any[] = order.offer || [];
+  const considerationItems: any[] = order.consideration || [];
+  const OOB_FEE = protocolFeeRecipient.toLowerCase();
+
+  let orderType: "listing" | "offer";
+  let nftContract: string;
+  let tokenId: string;
+  let tokenStandard: string;
+  let priceWei: bigint;
+  let currency: string;
+  let feeRecipient = "";
+  let feeBps = 0;
+  let royaltyRecipient = "";
+  let royaltyBps = 0;
+
+  const nftInOffer = offerItems.find((i: any) => Number(i.itemType) === 2 || Number(i.itemType) === 3);
+  const nftInConsideration = considerationItems.find((i: any) => Number(i.itemType) === 2 || Number(i.itemType) === 3);
+
+  if (nftInOffer) {
+    orderType = "listing";
+    nftContract = (nftInOffer.token || "").toLowerCase();
+    tokenId = String(nftInOffer.identifierOrCriteria || "0");
+    tokenStandard = Number(nftInOffer.itemType) === 2 ? "ERC721" : "ERC1155";
+    priceWei = 0n;
+    currency = "0x0000000000000000000000000000000000000000";
+
+    for (const item of considerationItems) {
+      const it = Number(item.itemType);
+      if (it === 0 || it === 1) {
+        priceWei += safeBigInt(item.startAmount);
+        if (it === 1) currency = (item.token || "").toLowerCase();
+        const recipient = (item.recipient || "").toLowerCase();
+        if (recipient !== offerer) {
+          if (recipient === OOB_FEE) {
+            feeRecipient = recipient;
+          } else if (!royaltyRecipient) {
+            royaltyRecipient = recipient;
+          }
+        }
+      }
+    }
+
+    if (priceWei > 0n) {
+      if (feeRecipient) {
+        const feeItem = considerationItems.find(
+          (i: any) => (i.recipient || "").toLowerCase() === feeRecipient && (Number(i.itemType) === 0 || Number(i.itemType) === 1),
+        );
+        if (feeItem) feeBps = Number((safeBigInt(feeItem.startAmount) * 10000n) / priceWei);
+      }
+      if (royaltyRecipient) {
+        let totalRoyaltyAmount = 0n;
+        for (const item of considerationItems) {
+          const it = Number(item.itemType);
+          if (it === 0 || it === 1) {
+            const r = (item.recipient || "").toLowerCase();
+            if (r !== offerer && r !== OOB_FEE) {
+              totalRoyaltyAmount += safeBigInt(item.startAmount);
+            }
+          }
+        }
+        if (totalRoyaltyAmount > 0n) royaltyBps = Number((totalRoyaltyAmount * 10000n) / priceWei);
+      }
+    }
+  } else if (nftInConsideration) {
+    orderType = "offer";
+    nftContract = (nftInConsideration.token || "").toLowerCase();
+    tokenId = String(nftInConsideration.identifierOrCriteria || "0");
+    tokenStandard = Number(nftInConsideration.itemType) === 2 ? "ERC721" : "ERC1155";
+    priceWei = 0n;
+    currency = "0x0000000000000000000000000000000000000000";
+    for (const item of offerItems) {
+      const it = Number(item.itemType);
+      if (it === 0 || it === 1) {
+        priceWei += safeBigInt(item.startAmount);
+        if (it === 1) currency = (item.token || "").toLowerCase();
+      }
+    }
+    // Fee/royalty from consideration (non-NFT items going to non-offerer)
+    for (const item of considerationItems) {
+      const it = Number(item.itemType);
+      if ((it === 0 || it === 1) && (item.recipient || "").toLowerCase() !== offerer) {
+        const recipient = (item.recipient || "").toLowerCase();
+        const amount = safeBigInt(item.startAmount);
+        if (recipient === OOB_FEE) {
+          feeRecipient = recipient;
+          if (priceWei > 0n) feeBps = Number((amount * 10000n) / priceWei);
+        } else {
+          royaltyRecipient = recipient;
+          if (priceWei > 0n) royaltyBps = Number((amount * 10000n) / priceWei);
+        }
+      }
+    }
+  } else {
+    return { ok: false, error: "Order must contain an NFT in offer or consideration" };
+  }
+
+  if (!nftContract || !isValidAddress(nftContract)) {
+    return { ok: false, error: "Invalid NFT contract address in order" };
+  }
+  if (priceWei <= 0n) {
+    return { ok: false, error: "Order price must be greater than zero" };
+  }
+
+  return {
+    ok: true,
+    parsed: {
+      orderType, nftContract, tokenId, tokenStandard,
+      priceWei, currency, feeRecipient, feeBps,
+      royaltyRecipient, royaltyBps,
+    },
+  };
 }
 
 // ─── Fee Enforcement ────────────────────────────────────────────────────────
@@ -179,6 +358,7 @@ function validateFeeEnforcement(
 // ─── Helper: map DB row → API response ──────────────────────────────────────
 
 function mapRowToOrder(row: any) {
+  const cm = resolveCurrency(row.chain_id, row.currency);
   return {
     orderHash: row.order_hash,
     chainId: row.chain_id,
@@ -189,6 +369,9 @@ function mapRowToOrder(row: any) {
     tokenStandard: row.token_standard,
     priceWei: row.price_wei,
     currency: row.currency,
+    currencySymbol: cm.currencySymbol,
+    currencyDecimals: cm.currencyDecimals,
+    priceDecimal: formatPriceDecimal(row.price_wei, cm.currencyDecimals),
     feeRecipient: row.fee_recipient,
     feeBps: row.fee_bps,
     royaltyRecipient: row.royalty_recipient || null,
@@ -230,8 +413,9 @@ export async function handleGetOrders(ctx: RouteContext): Promise<Response> {
   const sortBy = params.get("sortBy") || "created_at_desc";
   const limit = Math.min(Math.max(Number(params.get("limit") || 50), 1), 100);
   const offset = Math.max(Number(params.get("offset") || 0), 0);
+  const cursor = params.get("cursor"); // base64-encoded cursor for keyset pagination
 
-  const sql = getSqlClient(ctx.env.DATABASE_URL);
+  const sql = getPooledSqlClient(ctx.env);
 
   // Validate enum-like inputs
   const validStatuses = ["active", "filled", "cancelled", "expired", "stale"];
@@ -273,28 +457,76 @@ export async function handleGetOrders(ctx: RouteContext): Promise<Response> {
     queryParams.push(Math.floor(Date.now() / 1000));
   }
 
-  let orderClause = "ORDER BY created_at DESC";
-  if (sortBy === "price_asc") orderClause = "ORDER BY CAST(price_wei AS NUMERIC) ASC";
-  if (sortBy === "price_desc") orderClause = "ORDER BY CAST(price_wei AS NUMERIC) DESC";
+  // Cursor-based pagination: decode cursor and add keyset condition
+  let cursorDecoded: { created_at?: string; order_hash?: string; price_wei?: string } | null = null;
+  if (cursor) {
+    try {
+      cursorDecoded = JSON.parse(atob(cursor));
+    } catch {
+      return jsonError(400, "Invalid cursor format");
+    }
+  }
+
+  let orderClause = "ORDER BY created_at DESC, order_hash DESC";
+  if (sortBy === "price_asc") orderClause = "ORDER BY CAST(price_wei AS NUMERIC) ASC, order_hash ASC";
+  if (sortBy === "price_desc") orderClause = "ORDER BY CAST(price_wei AS NUMERIC) DESC, order_hash DESC";
+
+  // Apply cursor condition for keyset pagination
+  if (cursorDecoded) {
+    if (sortBy === "price_asc" && cursorDecoded.price_wei && cursorDecoded.order_hash) {
+      conditions.push(`(CAST(price_wei AS NUMERIC), order_hash) > (CAST($${paramIdx++} AS NUMERIC), $${paramIdx++})`);
+      queryParams.push(cursorDecoded.price_wei, cursorDecoded.order_hash);
+    } else if (sortBy === "price_desc" && cursorDecoded.price_wei && cursorDecoded.order_hash) {
+      conditions.push(`(CAST(price_wei AS NUMERIC), order_hash) < (CAST($${paramIdx++} AS NUMERIC), $${paramIdx++})`);
+      queryParams.push(cursorDecoded.price_wei, cursorDecoded.order_hash);
+    } else if (cursorDecoded.created_at && cursorDecoded.order_hash) {
+      conditions.push(`(created_at, order_hash) < ($${paramIdx++}::timestamptz, $${paramIdx++})`);
+      queryParams.push(cursorDecoded.created_at, cursorDecoded.order_hash);
+    }
+  }
 
   const whereClause = conditions.join(" AND ");
+  const useCursor = !!cursorDecoded;
 
   try {
-    const [rows, countResult] = await Promise.all([
-      sql(
-        `SELECT * FROM seaport_orders WHERE ${whereClause} ${orderClause} LIMIT $${paramIdx++} OFFSET $${paramIdx++}`,
-        [...queryParams, limit, offset],
-      ),
-      sql(
+    // When using cursor pagination, skip the COUNT query (not needed)
+    const rowsPromise = sql(
+      `SELECT * FROM seaport_orders WHERE ${whereClause} ${orderClause} LIMIT $${paramIdx++}${!useCursor ? ` OFFSET $${paramIdx++}` : ""}`,
+      useCursor ? [...queryParams, limit] : [...queryParams, limit, offset],
+    );
+
+    let total: number | undefined;
+    if (!useCursor) {
+      // Only run COUNT for offset-based pagination (backward compat)
+      const countResult = await sql(
         `SELECT COUNT(*) as total FROM seaport_orders WHERE ${whereClause}`,
         queryParams,
-      ),
-    ]);
+      );
+      total = Number(countResult[0]?.total || 0);
+    }
 
-    const total = Number(countResult[0]?.total || 0);
+    const rows = await rowsPromise;
     const orders = rows.map(mapRowToOrder);
 
-    return jsonResponse({ orders, total });
+    // Build next cursor from the last row
+    let nextCursor: string | null = null;
+    if (orders.length === limit && rows.length > 0) {
+      const lastRow = rows[rows.length - 1];
+      const cursorObj: Record<string, string> = {
+        created_at: lastRow.created_at,
+        order_hash: lastRow.order_hash,
+      };
+      if (sortBy === "price_asc" || sortBy === "price_desc") {
+        cursorObj.price_wei = lastRow.price_wei;
+      }
+      nextCursor = btoa(JSON.stringify(cursorObj));
+    }
+
+    return jsonResponse({
+      orders,
+      ...(total !== undefined ? { total } : {}),
+      nextCursor,
+    });
   } catch (err: any) {
     console.error("[oob-api] Failed to fetch orders:", err);
     return jsonError(500, "Failed to fetch orders");
@@ -308,7 +540,7 @@ export async function handleGetOrder(ctx: RouteContext): Promise<Response> {
   if (!orderHash) return jsonError(400, "Missing order hash");
   if (!HEX_STRING_RE.test(orderHash)) return jsonError(400, "Invalid order hash format");
 
-  const sql = getSqlClient(ctx.env.DATABASE_URL);
+  const sql = getPooledSqlClient(ctx.env);
 
   try {
     const rows = await sql`
@@ -335,7 +567,7 @@ export async function handleBestListing(ctx: RouteContext): Promise<Response> {
     return jsonError(400, "Missing chainId or collection");
   }
 
-  const sql = getSqlClient(ctx.env.DATABASE_URL);
+  const sql = getPooledSqlClient(ctx.env);
   const now = Math.floor(Date.now() / 1000);
 
   try {
@@ -384,7 +616,7 @@ export async function handleBestOffer(ctx: RouteContext): Promise<Response> {
     return jsonError(400, "Missing chainId or collection");
   }
 
-  const sql = getSqlClient(ctx.env.DATABASE_URL);
+  const sql = getPooledSqlClient(ctx.env);
   const now = Math.floor(Date.now() / 1000);
 
   try {
@@ -474,7 +706,7 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
 
   // Verify EIP-712 signature matches offerer
   try {
-    const { ethers } = await import("ethers");
+    // ethers is now a static top-level import
     // Reconstruct the EIP-712 domain and types for Seaport v1.6
     const domain = {
       name: "Seaport",
@@ -531,128 +763,18 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
     return jsonError(400, feeError);
   }
 
-  // Determine order type and extract NFT + price details
-  const offerItems: any[] = order.offer || [];
-  const considerationItems: any[] = order.consideration || [];
-
-  let orderType: "listing" | "offer";
-  let nftContract: string;
-  let tokenId: string;
-  let tokenStandard: string;
-  let priceWei: bigint;
-  let currency: string;
-  let feeRecipient = "";
-  let feeBps = 0;
-  let royaltyRecipient = "";
-  let royaltyBps = 0;
-
-  // Protocol fee recipient from env (server-enforced)
-  const OOB_FEE_RECIPIENT = (ctx.env.PROTOCOL_FEE_RECIPIENT || "0x0000000000000000000000000000000000000001").toLowerCase();
-
-  const nftInOffer = offerItems.find(
-    (i: any) => Number(i.itemType) === 2 || Number(i.itemType) === 3,
-  );
-  const nftInConsideration = considerationItems.find(
-    (i: any) => Number(i.itemType) === 2 || Number(i.itemType) === 3,
-  );
-
-  if (nftInOffer) {
-    // LISTING: seller offers NFT, wants payment
-    orderType = "listing";
-    nftContract = (nftInOffer.token || "").toLowerCase();
-    tokenId = String(nftInOffer.identifierOrCriteria || "0");
-    tokenStandard = Number(nftInOffer.itemType) === 2 ? "ERC721" : "ERC1155";
-
-    priceWei = 0n;
-    currency = "0x0000000000000000000000000000000000000000";
-
-    for (const item of considerationItems) {
-      const it = Number(item.itemType);
-      if (it === 0 || it === 1) {
-        priceWei += safeBigInt(item.startAmount);
-        if (it === 1) currency = (item.token || "").toLowerCase();
-
-        const recipient = (item.recipient || "").toLowerCase();
-        if (recipient !== offerer) {
-          if (recipient === OOB_FEE_RECIPIENT.toLowerCase()) {
-            feeRecipient = recipient;
-          } else if (!feeRecipient || feeRecipient === OOB_FEE_RECIPIENT.toLowerCase()) {
-            // Non-offerer, non-OOB recipient = royalty
-            royaltyRecipient = recipient;
-          }
-        }
-      }
-    }
-
-    // Calculate fee and royalty BPS
-    if (priceWei > 0n) {
-      if (feeRecipient) {
-        const feeItem = considerationItems.find(
-          (i: any) =>
-            (i.recipient || "").toLowerCase() === feeRecipient &&
-            (Number(i.itemType) === 0 || Number(i.itemType) === 1),
-        );
-        if (feeItem) {
-          const feeAmount = safeBigInt(feeItem.startAmount);
-          feeBps = Number((feeAmount * 10000n) / priceWei);
-        }
-      }
-      if (royaltyRecipient) {
-        const royaltyItem = considerationItems.find(
-          (i: any) =>
-            (i.recipient || "").toLowerCase() === royaltyRecipient &&
-            (Number(i.itemType) === 0 || Number(i.itemType) === 1),
-        );
-        if (royaltyItem) {
-          const royaltyAmount = safeBigInt(royaltyItem.startAmount);
-          royaltyBps = Number((royaltyAmount * 10000n) / priceWei);
-        }
-      }
-    }
-  } else if (nftInConsideration) {
-    // OFFER: bidder offers ERC20, wants NFT
-    orderType = "offer";
-    nftContract = (nftInConsideration.token || "").toLowerCase();
-    tokenId = String(nftInConsideration.identifierOrCriteria || "0");
-    tokenStandard = Number(nftInConsideration.itemType) === 2 ? "ERC721" : "ERC1155";
-
-    priceWei = 0n;
-    currency = "0x0000000000000000000000000000000000000000";
-    for (const item of offerItems) {
-      const it = Number(item.itemType);
-      if (it === 0 || it === 1) {
-        priceWei += safeBigInt(item.startAmount);
-        if (it === 1) currency = (item.token || "").toLowerCase();
-      }
-    }
-
-    // Fee/royalty from consideration (non-NFT items going to non-offerer)
-    for (const item of considerationItems) {
-      const it = Number(item.itemType);
-      if ((it === 0 || it === 1) && (item.recipient || "").toLowerCase() !== offerer) {
-        const recipient = (item.recipient || "").toLowerCase();
-        const amount = safeBigInt(item.startAmount);
-        if (recipient === OOB_FEE_RECIPIENT.toLowerCase()) {
-          feeRecipient = recipient;
-          if (priceWei > 0n) feeBps = Number((amount * 10000n) / priceWei);
-        } else {
-          royaltyRecipient = recipient;
-          if (priceWei > 0n) royaltyBps = Number((amount * 10000n) / priceWei);
-        }
-      }
-    }
-  } else {
-    return jsonError(400, "Order must contain an NFT in offer or consideration");
+  // Determine order type and extract NFT + price details (shared helper)
+  const OOB_FEE_RECIPIENT = (ctx.env.PROTOCOL_FEE_RECIPIENT || "0x0000000000000000000000000000000000000001");
+  const parseResult = parseOrderDetails(order, offerer, OOB_FEE_RECIPIENT);
+  if (!parseResult.ok) {
+    return jsonError(400, parseResult.error);
   }
-
-  if (!nftContract) return jsonError(400, "Could not extract NFT contract from order");
-  if (!isValidAddress(nftContract)) return jsonError(400, "Invalid NFT contract address in order");
-  if (priceWei <= 0n) return jsonError(400, "Order price must be greater than zero");
+  const { orderType, nftContract, tokenId, tokenStandard, priceWei, currency, feeRecipient, feeBps, royaltyRecipient, royaltyBps } = parseResult.parsed;
 
   // Compute the real Seaport EIP-712 order hash (matches on-chain events)
   const orderHash = computeOrderHash(order, Number(chainId));
 
-  const sql = getSqlClient(ctx.env.DATABASE_URL);
+  const sql = getPooledSqlClient(ctx.env);
 
   try {
     // Check for duplicate
@@ -723,6 +845,12 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
       currency,
     });
 
+    // Broadcast to WebSocket clients (fire-and-forget)
+    broadcastOrderEvent(ctx.env, orderType === "listing" ? "new_listing" : "new_offer", {
+      orderHash, chainId: Number(chainId), nftContract, tokenId, offerer,
+      priceWei: priceWei.toString(), currency, orderType,
+    });
+
     return jsonResponse({ orderHash, status: "active" }, 201);
   } catch (err: any) {
     console.error("[oob-api] Failed to insert order:", err);
@@ -746,7 +874,7 @@ export async function handleCancelOrder(ctx: RouteContext): Promise<Response> {
     // body parse failure is OK — signature may be missing, handled below
   }
 
-  const sql = getSqlClient(ctx.env.DATABASE_URL);
+  const sql = getPooledSqlClient(ctx.env);
 
   // Look up the order to verify the caller is the offerer
   const orderRows = await sql`
@@ -769,7 +897,7 @@ export async function handleCancelOrder(ctx: RouteContext): Promise<Response> {
 
   // Verify EIP-191 personal_sign: sign("cancel:" + orderHash)
   try {
-    const { ethers } = await import("ethers");
+    // ethers is now a static top-level import
     const message = `cancel:${orderHash}`;
     const recovered = ethers.verifyMessage(message, cancelSig);
     if (recovered.toLowerCase() !== orderRows[0].offerer.toLowerCase()) {
@@ -805,6 +933,13 @@ export async function handleCancelOrder(ctx: RouteContext): Promise<Response> {
       txHash: null,
     });
 
+    // Broadcast to WebSocket clients (fire-and-forget)
+    broadcastOrderEvent(ctx.env, "cancellation", {
+      orderHash, chainId: orderRows[0].chain_id || 0,
+      nftContract: orderRows[0].nft_contract, tokenId: orderRows[0].token_id,
+      offerer: orderRows[0].offerer,
+    });
+
     return jsonResponse({ orderHash, status: "cancelled" });
   } catch (err: any) {
     console.error("[oob-api] Failed to cancel order:", err);
@@ -823,7 +958,7 @@ export async function handleCollectionStats(ctx: RouteContext): Promise<Response
     return jsonError(400, "Missing chainId or collection address");
   }
 
-  const sql = getSqlClient(ctx.env.DATABASE_URL);
+  const sql = getPooledSqlClient(ctx.env);
   const now = Math.floor(Date.now() / 1000);
 
   try {
@@ -871,27 +1006,36 @@ export async function handleCollectionStats(ctx: RouteContext): Promise<Response
 export async function handleGetActivity(ctx: RouteContext): Promise<Response> {
   const { params } = ctx;
   const chainIdRaw = params.get("chainId");
-  if (!chainIdRaw || !isValidChainId(chainIdRaw)) {
-    return jsonError(400, "Missing or invalid chainId parameter");
+  const orderHash = params.get("orderHash");
+
+  // chainId is optional when querying by orderHash (orderHash is globally unique)
+  let chainId: number | null = null;
+  if (chainIdRaw) {
+    if (!isValidChainId(chainIdRaw)) {
+      return jsonError(400, "Invalid chainId parameter");
+    }
+    chainId = Number(chainIdRaw);
+  } else if (!orderHash) {
+    return jsonError(400, "Missing chainId parameter (required unless orderHash is provided)");
   }
-  const chainId = Number(chainIdRaw);
 
   const collection = params.get("collection")?.toLowerCase();
   const tokenId = params.get("tokenId");
-  const orderHash = params.get("orderHash");
   const eventType = params.get("eventType");
   const address = params.get("address")?.toLowerCase(); // from or to
   const limit = Math.min(Math.max(Number(params.get("limit") || 50), 1), 200);
   const offset = Math.max(Number(params.get("offset") || 0), 0);
 
-  const sql = getSqlClient(ctx.env.DATABASE_URL);
+  const sql = getPooledSqlClient(ctx.env);
 
   const conditions: string[] = [];
   const queryParams: any[] = [];
   let paramIdx = 1;
 
-  conditions.push(`chain_id = $${paramIdx++}`);
-  queryParams.push(chainId);
+  if (chainId !== null) {
+    conditions.push(`chain_id = $${paramIdx++}`);
+    queryParams.push(chainId);
+  }
 
   if (collection) {
     conditions.push(`nft_contract = $${paramIdx++}`);
@@ -918,7 +1062,7 @@ export async function handleGetActivity(ctx: RouteContext): Promise<Response> {
     paramIdx++;
   }
 
-  const whereClause = conditions.join(" AND ");
+  const whereClause = conditions.length > 0 ? conditions.join(" AND ") : "TRUE";
 
   try {
     const [rows, countResult] = await Promise.all([
@@ -933,20 +1077,26 @@ export async function handleGetActivity(ctx: RouteContext): Promise<Response> {
     ]);
 
     const total = Number(countResult[0]?.total || 0);
-    const activity = rows.map((r: any) => ({
-      id: r.id,
-      orderHash: r.order_hash,
-      chainId: r.chain_id,
-      eventType: r.event_type,
-      fromAddress: r.from_address,
-      toAddress: r.to_address,
-      nftContract: r.nft_contract,
-      tokenId: r.token_id,
-      priceWei: r.price_wei,
-      currency: r.currency,
-      txHash: r.tx_hash,
-      createdAt: r.created_at,
-    }));
+    const activity = rows.map((r: any) => {
+      const cm = resolveCurrency(r.chain_id, r.currency);
+      return {
+        id: r.id,
+        orderHash: r.order_hash,
+        chainId: r.chain_id,
+        eventType: r.event_type,
+        fromAddress: r.from_address,
+        toAddress: r.to_address,
+        nftContract: r.nft_contract,
+        tokenId: r.token_id,
+        priceWei: r.price_wei,
+        currency: r.currency,
+        currencySymbol: cm.currencySymbol,
+        currencyDecimals: cm.currencyDecimals,
+        priceDecimal: formatPriceDecimal(r.price_wei, cm.currencyDecimals),
+        txHash: r.tx_hash,
+        createdAt: r.created_at,
+      };
+    });
 
     return jsonResponse({ activity, total });
   } catch (err: any) {
@@ -995,7 +1145,7 @@ export async function handleBatchSubmitOrders(ctx: RouteContext): Promise<Respon
     return jsonError(400, `Batch size exceeds maximum (${MAX_BATCH_SIZE})`);
   }
 
-  const sql = getSqlClient(ctx.env.DATABASE_URL);
+  const sql = getPooledSqlClient(ctx.env);
   const results: BatchSubmitResult[] = [];
 
   for (const item of orders as BatchOrderInput[]) {
@@ -1055,7 +1205,7 @@ async function processSingleOrderSubmit(
 
   // Verify EIP-712 signature
   try {
-    const { ethers } = await import("ethers");
+    // ethers is now a static top-level import
     const domain = {
       name: "Seaport", version: "1.6",
       chainId: Number(chainId),
@@ -1095,76 +1245,13 @@ async function processSingleOrderSubmit(
     return { orderHash: "", status: "error", error: feeError };
   }
 
-  // Extract NFT + price details
-  const offerItems: any[] = order.offer || [];
-  const considerationItems: any[] = order.consideration || [];
-  const OOB_FEE_RECIPIENT = (env.PROTOCOL_FEE_RECIPIENT || "0x0000000000000000000000000000000000000001").toLowerCase();
-
-  let orderType: "listing" | "offer";
-  let nftContract: string;
-  let tokenId: string;
-  let tokenStandard: string;
-  let priceWei: bigint;
-  let currency: string;
-  let feeRecipient = "";
-  let feeBps = 0;
-  let royaltyRecipient = "";
-  let royaltyBps = 0;
-
-  const nftInOffer = offerItems.find((i: any) => Number(i.itemType) === 2 || Number(i.itemType) === 3);
-  const nftInConsideration = considerationItems.find((i: any) => Number(i.itemType) === 2 || Number(i.itemType) === 3);
-
-  if (nftInOffer) {
-    orderType = "listing";
-    nftContract = (nftInOffer.token || "").toLowerCase();
-    tokenId = String(nftInOffer.identifierOrCriteria || "0");
-    tokenStandard = Number(nftInOffer.itemType) === 2 ? "ERC721" : "ERC1155";
-    priceWei = 0n;
-    currency = "0x0000000000000000000000000000000000000000";
-    for (const ci of considerationItems) {
-      const it = Number(ci.itemType);
-      if (it === 0 || it === 1) {
-        priceWei += safeBigInt(ci.startAmount);
-        if (it === 1) currency = (ci.token || "").toLowerCase();
-        const recipient = (ci.recipient || "").toLowerCase();
-        if (recipient !== offerer) {
-          if (recipient === OOB_FEE_RECIPIENT.toLowerCase()) feeRecipient = recipient;
-          else royaltyRecipient = recipient;
-        }
-      }
-    }
-    if (priceWei > 0n && feeRecipient) {
-      const feeItem = considerationItems.find((i: any) => (i.recipient || "").toLowerCase() === feeRecipient && (Number(i.itemType) === 0 || Number(i.itemType) === 1));
-      if (feeItem) feeBps = Number((safeBigInt(feeItem.startAmount) * 10000n) / priceWei);
-    }
-    if (priceWei > 0n && royaltyRecipient) {
-      const royaltyItem = considerationItems.find((i: any) => (i.recipient || "").toLowerCase() === royaltyRecipient && (Number(i.itemType) === 0 || Number(i.itemType) === 1));
-      if (royaltyItem) royaltyBps = Number((safeBigInt(royaltyItem.startAmount) * 10000n) / priceWei);
-    }
-  } else if (nftInConsideration) {
-    orderType = "offer";
-    nftContract = (nftInConsideration.token || "").toLowerCase();
-    tokenId = String(nftInConsideration.identifierOrCriteria || "0");
-    tokenStandard = Number(nftInConsideration.itemType) === 2 ? "ERC721" : "ERC1155";
-    priceWei = 0n;
-    currency = "0x0000000000000000000000000000000000000000";
-    for (const oi of offerItems) {
-      const it = Number(oi.itemType);
-      if (it === 0 || it === 1) {
-        priceWei += safeBigInt(oi.startAmount);
-        if (it === 1) currency = (oi.token || "").toLowerCase();
-      }
-    }
-  } else {
-    return { orderHash: "", status: "error", error: "Order must contain an NFT in offer or consideration" };
+  // Extract NFT + price details (shared helper)
+  const OOB_FEE_RECIPIENT = (env.PROTOCOL_FEE_RECIPIENT || "0x0000000000000000000000000000000000000001");
+  const parseResult = parseOrderDetails(order, offerer, OOB_FEE_RECIPIENT);
+  if (!parseResult.ok) {
+    return { orderHash: "", status: "error", error: parseResult.error };
   }
-
-  if (!nftContract || !isValidAddress(nftContract)) {
-    return { orderHash: "", status: "error", error: "Invalid NFT contract address" };
-  }
-  if (priceWei <= 0n) {
-    return { orderHash: "", status: "error", error: "Order price must be greater than zero" };
-  }
+  const { orderType, nftContract, tokenId, tokenStandard, priceWei, currency, feeRecipient, feeBps, royaltyRecipient, royaltyBps } = parseResult.parsed;
 
   const orderHash = computeOrderHash(order, Number(chainId));
 
@@ -1263,7 +1350,7 @@ export async function handleBatchCancelOrders(ctx: RouteContext): Promise<Respon
     return jsonError(400, `Batch size exceeds maximum (${MAX_BATCH_SIZE})`);
   }
 
-  const sql = getSqlClient(ctx.env.DATABASE_URL);
+  const sql = getPooledSqlClient(ctx.env);
   const results: BatchCancelResult[] = [];
 
   for (const item of cancellations as BatchCancelInput[]) {
@@ -1311,7 +1398,7 @@ async function processSingleOrderCancel(
   }
 
   try {
-    const { ethers } = await import("ethers");
+    // ethers is now a static top-level import
     const message = `cancel:${orderHash}`;
     const recovered = ethers.verifyMessage(message, cancelSig);
     if (recovered.toLowerCase() !== orderRows[0].offerer.toLowerCase()) {

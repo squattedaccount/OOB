@@ -1,5 +1,6 @@
 export interface Env {
   DATABASE_URL: string;
+  POOL_DATABASE_URL?: string; // Neon pooled endpoint (add -pooler to endpoint ID in Neon dashboard)
   API_ADMIN_TOKEN?: string;
   // Protocol fee enforcement (OOB takes this on every order)
   PROTOCOL_FEE_RECIPIENT: string;  // Required — OOB treasury address
@@ -15,6 +16,11 @@ export interface Env {
   OOB_RATE_LIMIT?: KVNamespace;
   // Durable Object for WebSocket streams
   ORDER_STREAM?: DurableObjectNamespace;
+  // Internal secret for DO broadcast auth (set via wrangler secret put)
+  INTERNAL_SECRET?: string;
+  // Number of DO shards per room (default 1). Increase for high-traffic collections.
+  // Each shard is a separate DO instance; broadcaster fans out to all shards.
+  DO_SHARD_COUNT?: string;
 }
 
 export interface RouteContext {

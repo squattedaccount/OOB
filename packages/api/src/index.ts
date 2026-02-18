@@ -21,6 +21,7 @@
 import type { Env, RouteContext } from "./types.js";
 import { jsonResponse, jsonError, corsPreflightResponse } from "./response.js";
 import { checkRateLimit, addRateLimitHeaders } from "./rateLimit.js";
+import { logRequestAudit } from "./audit.js";
 import {
   handleGetOrders,
   handleGetOrder,
@@ -54,6 +55,11 @@ export default {
     }
 
     const isWrite = request.method === "POST" || request.method === "DELETE";
+
+    // Audit log write operations
+    if (isWrite) {
+      logRequestAudit(request, env, url.pathname);
+    }
 
     // Rate limiting
     const rateLimitResponse = await checkRateLimit(request, env, isWrite);
@@ -90,11 +96,33 @@ async function handleStreamUpgrade(
   const collection = params.get("collection")?.toLowerCase() || "all";
   const roomId = `${chainId}:${collection}`;
 
-  const id = env.ORDER_STREAM.idFromName(roomId);
+  // Sharding: distribute clients across N DO instances per room.
+  // DO_SHARD_COUNT=1 (default) means no sharding — single DO per room.
+  // Set DO_SHARD_COUNT=4 for high-traffic collections (e.g. >500 concurrent clients).
+  // Each shard is an independent DO; broadcaster fans out to all shards.
+  const shardCount = Math.max(1, parseInt(env.DO_SHARD_COUNT || "1", 10));
+  const shard = shardCount === 1 ? 0 : pickShard(request, shardCount);
+  const shardedRoomId = shardCount === 1 ? roomId : `${roomId}:s${shard}`;
+
+  const id = env.ORDER_STREAM.idFromName(shardedRoomId);
   const stub = env.ORDER_STREAM.get(id);
 
   // Forward the request to the Durable Object
   return stub.fetch(request);
+}
+
+/**
+ * Pick a shard index for a connecting client.
+ * Uses CF-Connecting-IP for sticky routing (same IP → same shard),
+ * which avoids unnecessary cross-shard reconnects on refresh.
+ */
+function pickShard(request: Request, shardCount: number): number {
+  const ip = request.headers.get("CF-Connecting-IP") || Math.random().toString();
+  let hash = 0;
+  for (let i = 0; i < ip.length; i++) {
+    hash = (hash * 31 + ip.charCodeAt(i)) >>> 0; // unsigned 32-bit
+  }
+  return hash % shardCount;
 }
 
 async function route(
@@ -135,6 +163,13 @@ async function route(
     // GET /v1/orders/best-offer
     if (segments[2] === "best-offer" && method === "GET") {
       return handleBestOffer(ctx);
+    }
+
+    // GET /v1/orders/:hash/activity
+    if (segments[2] && segments[3] === "activity" && segments.length === 4 && method === "GET") {
+      // Rewrite as /v1/activity?orderHash=:hash for convenience
+      ctx.params.set("orderHash", segments[2]);
+      return handleGetActivity(ctx);
     }
 
     // GET /v1/orders/:hash (must be a hash, not a sub-route)

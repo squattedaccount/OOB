@@ -239,11 +239,11 @@ export class SeaportClient {
       zone: "0x0000000000000000000000000000000000000000",
       offer: [
         {
-          itemType: ItemType.ERC721,
+          itemType: params.tokenStandard === "ERC1155" ? ItemType.ERC1155 : ItemType.ERC721,
           token: getAddress(params.collection),
           identifierOrCriteria: params.tokenId,
-          startAmount: "1",
-          endAmount: "1",
+          startAmount: params.quantity ? String(params.quantity) : "1",
+          endAmount: params.quantity ? String(params.quantity) : "1",
         },
       ],
       consideration,
@@ -292,8 +292,12 @@ export class SeaportClient {
 
     // Determine if this is a specific token offer or collection offer
     const isCollectionOffer = !params.tokenId;
-    const nftItemType = isCollectionOffer ? ItemType.ERC721_WITH_CRITERIA : ItemType.ERC721;
+    const isERC1155 = params.tokenStandard === "ERC1155";
+    const nftItemType = isCollectionOffer
+      ? (isERC1155 ? ItemType.ERC1155_WITH_CRITERIA : ItemType.ERC721_WITH_CRITERIA)
+      : (isERC1155 ? ItemType.ERC1155 : ItemType.ERC721);
     const tokenIdOrCriteria = params.tokenId ?? "0";
+    const nftQuantity = params.quantity ? String(params.quantity) : "1";
 
     const consideration: SeaportConsiderationItem[] = [
       // Offerer wants the NFT
@@ -301,8 +305,8 @@ export class SeaportClient {
         itemType: nftItemType,
         token: getAddress(params.collection),
         identifierOrCriteria: tokenIdOrCriteria,
-        startAmount: "1",
-        endAmount: "1",
+        startAmount: nftQuantity,
+        endAmount: nftQuantity,
         recipient: offerer,
       },
     ];
