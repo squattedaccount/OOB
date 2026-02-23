@@ -67,7 +67,22 @@ export default {
 
 async function runCron(env: Env): Promise<void> {
   const startMs = Date.now();
+  let lockValue: string | null = null;
+  let lock: import("./lock.js").IndexerLock | null = null;
+
   try {
+    // Try to acquire distributed lock to prevent multiple indexer instances from running simultaneously
+    if (env.UPSTASH_REDIS_REST_URL && env.UPSTASH_REDIS_REST_TOKEN) {
+      const { IndexerLock } = await import("./lock.js");
+      lock = new IndexerLock(env);
+      lockValue = await lock.acquire("indexer-cron", 300); // 5 minute lock
+      if (!lockValue) {
+        console.log("[oob-indexer] Cron already running on another instance, skipping");
+        return;
+      }
+      console.log("[oob-indexer] Acquired cron lock, starting indexer tasks");
+    }
+
     const sql = getSqlClient(env.DATABASE_URL);
     const result = await handleCron(sql, env);
     const durationMs = Date.now() - startMs;
@@ -77,6 +92,16 @@ async function runCron(env: Env): Promise<void> {
     );
   } catch (err) {
     console.error("[oob-indexer] Cron failed:", err);
+  } finally {
+    // Always release the lock using the same instance acquired above
+    if (lock && lockValue) {
+      try {
+        await lock.release("indexer-cron", lockValue);
+        console.log("[oob-indexer] Released cron lock");
+      } catch (lockErr) {
+        console.error("[oob-indexer] Failed to release cron lock:", lockErr);
+      }
+    }
   }
 }
 

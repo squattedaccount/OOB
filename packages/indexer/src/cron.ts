@@ -137,11 +137,11 @@ function buildMulticallCalldata(listings: ListingRow[]): string {
 
   // Each Call struct is dynamic (contains bytes), so we encode:
   // 1. Array of offsets to each Call struct (relative to start of array body)
-  // 2. Each Call struct: address (32 bytes) + offset-to-bytes (32) + bytes-length (32) + bytes-data (32)
-  // Each Call struct body = 4 × 32 bytes = 128 bytes = 256 hex chars
-  // Offset to Call[i] = i * 128 bytes (since all calls have same fixed size)
+  // 2. Each Call struct: address (32 bytes) + offset-to-bytes (32) + bytes-length (32) + bytes-data (64, padded to 32-byte boundary)
+  // Each Call struct body = 32+32+32+64 = 160 bytes = 320 hex chars
+  // Offset to Call[i] = i * 160 bytes (since all calls have same fixed size)
 
-  const callStructSize = 128; // bytes per encoded Call struct
+  const callStructSize = 160; // bytes per encoded Call struct
   const offsets = listings
     .map((_, i) => (i * callStructSize).toString(16).padStart(64, "0"))
     .join("");
@@ -149,10 +149,10 @@ function buildMulticallCalldata(listings: ListingRow[]): string {
   const callBodies = listings.map((l) => {
     const target = l.nft_contract.slice(2).toLowerCase().padStart(64, "0");
     const bytesOffset = "40".padStart(64, "0"); // callData starts at offset 64 within this struct
-    const bytesLen = "24".padStart(64, "0");    // 36 bytes = 4 selector + 32 tokenId
+    const bytesLen = "24".padStart(64, "0");    // 36 bytes = 4 selector + 32 tokenId (0x24 = 36)
     const callData = OWNER_OF_SELECTOR.slice(2) + encodeUint256(l.token_id);
-    // callData is 36 bytes, padded to 64 bytes (next 32-byte boundary)
-    const callDataPadded = callData.padEnd(64, "0");
+    // callData is 36 bytes = 72 hex chars; must pad to next 32-byte boundary = 64 bytes = 128 hex chars
+    const callDataPadded = callData.padEnd(128, "0");
     return target + bytesOffset + bytesLen + callDataPadded;
   }).join("");
 
@@ -185,8 +185,8 @@ async function checkOwnershipMulticall(
     });
 
     const json = (await resp.json()) as any;
-    if (!json.result || json.result === "0x") {
-      console.warn("[oob-indexer] Multicall3 returned empty result, falling back to individual calls");
+    if (json.error || !json.result || json.result === "0x") {
+      console.warn("[oob-indexer] Multicall3 returned empty/error result, falling back to individual calls", json.error?.message);
       return checkOwnershipIndividual(rpcUrl, listings);
     }
 
@@ -230,7 +230,7 @@ async function checkOwnershipIndividual(
         }),
       });
       const json = (await resp.json()) as any;
-      if (json.result && json.result.length >= 42) {
+      if (!json.error && json.result && json.result.length >= 42) {
         const owner = "0x" + json.result.slice(-40).toLowerCase();
         if (owner !== listing.offerer.toLowerCase()) {
           stale.add(listing.order_hash);

@@ -115,11 +115,15 @@ export class SeaportClient {
   private marketplaceFeeRecipient: string;
 
   constructor(config: OobConfig) {
-    if ((config.feeBps ?? DEFAULT_FEE_BPS) > 0 && !(config.feeRecipient ?? DEFAULT_FEE_RECIPIENT)) {
+    const feeBps = config.feeBps ?? DEFAULT_FEE_BPS;
+    if (feeBps !== 0 && (!Number.isFinite(feeBps) || !Number.isInteger(feeBps) || feeBps < 0 || feeBps > 10000)) {
+      throw new Error(`Invalid feeBps: must be an integer between 0 and 10000 (got ${feeBps})`);
+    }
+    if (feeBps > 0 && !(config.feeRecipient ?? DEFAULT_FEE_RECIPIENT)) {
       throw new Error("Invalid config: feeRecipient is required when feeBps > 0");
     }
     this.chainId = config.chainId;
-    this.marketplaceFeeBps = config.feeBps ?? DEFAULT_FEE_BPS;
+    this.marketplaceFeeBps = feeBps;
     this.marketplaceFeeRecipient = config.feeRecipient ?? DEFAULT_FEE_RECIPIENT;
   }
 
@@ -152,6 +156,16 @@ export class SeaportClient {
     // Calculate protocol fee (from API config)
     const protocolFeeBps = protocolConfig?.protocolFeeBps ?? 0;
     const protocolFeeRecipient = protocolConfig?.protocolFeeRecipient ?? "";
+    const royaltyBps = params.royaltyBps ?? 0;
+
+    // Validate total deductions do not exceed 100%
+    const totalBps = protocolFeeBps + this.marketplaceFeeBps + royaltyBps;
+    if (totalBps > 10000) {
+      throw new Error(
+        `Total fees exceed 100%: protocolFee=${protocolFeeBps} + marketplaceFee=${this.marketplaceFeeBps} + royalty=${royaltyBps} = ${totalBps} bps`,
+      );
+    }
+
     const protocolFeeAmount = protocolFeeBps > 0 && protocolFeeRecipient
       ? (priceWei * BigInt(protocolFeeBps)) / 10000n
       : 0n;
@@ -281,6 +295,16 @@ export class SeaportClient {
     // Calculate protocol fee (from API config)
     const protocolFeeBps = protocolConfig?.protocolFeeBps ?? 0;
     const protocolFeeRecipient = protocolConfig?.protocolFeeRecipient ?? "";
+    const royaltyBps = params.royaltyBps ?? 0;
+
+    // Validate total deductions do not exceed 100%
+    const totalBps = protocolFeeBps + this.marketplaceFeeBps + royaltyBps;
+    if (totalBps > 10000) {
+      throw new Error(
+        `Total fees exceed 100%: protocolFee=${protocolFeeBps} + marketplaceFee=${this.marketplaceFeeBps} + royalty=${royaltyBps} = ${totalBps} bps`,
+      );
+    }
+
     const protocolFeeAmount = protocolFeeBps > 0 && protocolFeeRecipient
       ? (amountWei * BigInt(protocolFeeBps)) / 10000n
       : 0n;

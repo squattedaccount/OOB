@@ -30,7 +30,7 @@ Query orders with filters. Returns paginated results.
 
 | Param | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `chainId` | number | **yes** | — | Chain ID (1, 8453, 84532, 999, 2020, 2741) |
+| `chainId` | number | **yes** | — | Chain ID (1, 8453, 84532, 999, 2020, 202601, 2741) |
 | `collection` | string | no | — | NFT contract address (lowercased) |
 | `tokenId` | string | no | — | Specific token ID |
 | `type` | string | no | — | `listing` or `offer` |
@@ -110,6 +110,61 @@ Get a single order by its hash.
 ```
 
 Returns `404` if the order doesn't exist.
+
+---
+
+### GET /v1/orders/:hash/activity
+
+Get activity events for a specific order hash.
+
+**Parameters:**
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `hash` | string (path) | **yes** | The order hash |
+
+**Response:**
+
+```json
+{
+  "activity": [
+    {
+      "eventType": "stale",
+      "orderHash": "0xabc123...",
+      "chainId": 8453,
+      "fromAddress": "0x1234...abcd",
+      "nftContract": "0xnft...addr",
+      "tokenId": "42",
+      "priceWei": "1000000000000000000",
+      "txHash": "0xtx...",
+      "createdAt": "2026-02-18T20:15:00.000Z"
+    }
+  ]
+}
+```
+
+---
+
+### GET /v1/orders/:hash/fill-tx
+
+Build ready-to-sign transaction calldata to fill a specific order.
+
+**Parameters:**
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `hash` | string (path) | **yes** | The order hash |
+
+**Response:**
+
+```json
+{
+  "to": "0x0000000000000068F116a894984e2DB1123eB395",
+  "data": "0x...",
+  "value": "1000000000000000000",
+  "chainId": 8453
+}
+```
 
 ---
 
@@ -275,6 +330,49 @@ Submit a signed Seaport order to the order book.
 
 ---
 
+### POST /v1/orders/batch
+
+Submit up to 20 signed orders in one request.
+
+**Request body:**
+
+```json
+{
+  "orders": [
+    { "chainId": 8453, "order": { "...": "..." }, "signature": "0xsig..." }
+  ]
+}
+```
+
+**Response:**
+
+```json
+{
+  "results": [
+    { "orderHash": "0xabc123...", "status": "active" }
+  ]
+}
+```
+
+---
+
+### POST /v1/orders/batch/fill-tx
+
+Build sweep calldata for filling up to 20 orders in one on-chain transaction.
+
+**Response:**
+
+```json
+{
+  "to": "0x0000000000000068F116a894984e2DB1123eB395",
+  "data": "0x...",
+  "value": "...",
+  "chainId": 8453
+}
+```
+
+---
+
 ### DELETE /v1/orders/:hash
 
 Mark an order as cancelled. Typically called after the on-chain `cancel()` transaction.
@@ -306,6 +404,18 @@ Returns `404` if the order doesn't exist or is already cancelled/filled.
 
 ---
 
+### DELETE /v1/orders/batch
+
+Cancel up to 20 orders in one request.
+
+---
+
+### GET /v1/orders/best-listing/fill-tx
+
+Get floor listing and build ready-to-sign fill calldata in a single call.
+
+---
+
 ### GET /health
 
 Health check endpoint.
@@ -316,6 +426,43 @@ Health check endpoint.
 {
   "status": "healthy",
   "service": "oob-api"
+}
+```
+
+---
+
+### GET /v1/config
+
+Get protocol fee configuration used by the API.
+
+**Response:**
+
+```json
+{
+  "protocolFeeBps": 50,
+  "protocolFeeRecipient": "0x0000000000000000000000000000000000000001"
+}
+```
+
+---
+
+### GET /v1/erc20/:token/approve-tx
+
+Build ERC20 `approve` calldata for Seaport spending.
+
+**Parameters:**
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `token` | string (path) | **yes** | ERC20 token address to approve |
+
+**Response:**
+
+```json
+{
+  "to": "0x4200000000000000000000000000000000000006",
+  "data": "0x...",
+  "value": "0x0"
 }
 ```
 

@@ -14,9 +14,18 @@ RATE_LIMIT_PUBLIC_WRITES = "30"
 RATE_LIMIT_REGISTERED_READS = "300"
 RATE_LIMIT_REGISTERED_WRITES = "60"
 
-# Secrets (set via wrangler secret put):
-# - DATABASE_URL (Neon Postgres connection string)
-# - API_ADMIN_TOKEN (for admin endpoints, optional)
+# Secrets (set via wrangler secret put — NEVER put these in [vars]):
+# - DATABASE_URL              (Neon Postgres connection string)
+# - API_ADMIN_TOKEN           (for admin endpoints, optional)
+# - API_KEYS                  (comma-separated registered API keys, e.g. "key1,key2")
+# - UPSTASH_REDIS_REST_URL    (Upstash Redis REST endpoint)
+# - UPSTASH_REDIS_REST_TOKEN  (Upstash Redis REST token)
+#
+# Example:
+#   wrangler secret put API_KEYS
+#   wrangler secret put DATABASE_URL
+#   wrangler secret put UPSTASH_REDIS_REST_URL
+#   wrangler secret put UPSTASH_REDIS_REST_TOKEN
 
 # KV for rate limiting counters
 # Create with: wrangler kv:namespace create "OOB_RATE_LIMIT"

@@ -33,3 +33,16 @@ bindings = [
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["OrderStreamDO"]
+
+# Queue for write-behind order ingestion (optional — falls back to direct DB write if not configured)
+# Create with: wrangler queues create oob-order-ingest
+[[queues.producers]]
+binding = "ORDER_INGEST_QUEUE"
+queue = "oob-order-ingest"
+
+[[queues.consumers]]
+queue = "oob-order-ingest"
+max_batch_size = 50
+max_batch_timeout = 2
+max_retries = 3
+dead_letter_queue = "oob-order-ingest-dlq"

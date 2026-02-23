@@ -91,20 +91,20 @@ export class OrderStreamDO {
 
     const eventsParam = params.get("events");
     if (eventsParam) {
-      filter.events = new Set(eventsParam.split(",").map((e) => e.trim()).filter(Boolean));
+      filter.events = new Set(eventsParam.split(",").map((e) => e.trim()).filter(Boolean).slice(0, 20));
     }
 
     const chainIdsParam = params.get("chainIds");
     if (chainIdsParam) {
       filter.chainIds = new Set(
-        chainIdsParam.split(",").map((c) => Number(c.trim())).filter((n) => Number.isFinite(n)),
+        chainIdsParam.split(",").map((c) => Number(c.trim())).filter((n) => Number.isFinite(n)).slice(0, 20),
       );
     }
 
     const collectionsParam = params.get("collections");
     if (collectionsParam) {
       filter.collections = new Set(
-        collectionsParam.split(",").map((c) => c.trim().toLowerCase()).filter(Boolean),
+        collectionsParam.split(",").map((c) => c.trim().toLowerCase()).filter(Boolean).slice(0, 100),
       );
     }
 
@@ -131,13 +131,13 @@ export class OrderStreamDO {
         const session = this.sessions.get(ws);
         if (session) {
           if (Array.isArray(data.events)) {
-            session.events = new Set(data.events);
+            session.events = new Set(data.events.slice(0, 20));
           }
           if (Array.isArray(data.chainIds)) {
-            session.chainIds = new Set(data.chainIds.map(Number).filter(Number.isFinite));
+            session.chainIds = new Set(data.chainIds.slice(0, 20).map(Number).filter(Number.isFinite));
           }
           if (Array.isArray(data.collections)) {
-            session.collections = new Set(data.collections.map((c: string) => String(c).toLowerCase()));
+            session.collections = new Set(data.collections.slice(0, 100).map((c: string) => String(c).toLowerCase()));
           }
           ws.send(JSON.stringify({ type: "subscribed", filters: {
             events: session.events ? [...session.events] : null,

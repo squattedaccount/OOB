@@ -7,7 +7,9 @@ Standalone Cloudflare Worker that monitors Seaport v1.6 on-chain events and mana
 1. **Webhook receiver** — accepts on-chain log events from Alchemy, Moralis, or Goldsky
 2. **Order lifecycle** — updates `seaport_orders` status when orders are filled, cancelled, or bulk-cancelled on-chain
 3. **Expiry cron** — marks orders past their `end_time` as expired (every 5 min)
-4. **Stale detection** — checks NFT ownership via RPC and marks transferred-away listings as stale
+4. **Transfer stale detection (realtime)** — decodes ERC-721 `Transfer` logs and marks matching active listings as stale
+5. **Ownership stale backstop (cron)** — round-robin owner checks using one Multicall3 call per chain when supported
+6. **Goldsky pipeline sync** — auto-generates/applies transfer pipelines from active collections
 
 ## Seaport Events Monitored
 
@@ -26,8 +28,10 @@ npm install
 # Set secrets
 wrangler secret put DATABASE_URL      # Same Neon DB as oob-api
 wrangler secret put WEBHOOK_SECRET    # Shared secret for webhook verification
-wrangler secret put RPC_URL_BASE      # Alchemy/Infura RPC for Base
-wrangler secret put RPC_URL_ETHEREUM  # Alchemy/Infura RPC for Ethereum
+wrangler secret put RPC_URL_BASE      # Base (8453)
+wrangler secret put RPC_URL_ETHEREUM  # Ethereum (1)
+wrangler secret put RPC_URL_BASE_SEPOLIA # Base Sepolia (84532)
+wrangler secret put RPC_URL_ABSTRACT  # Abstract (2741)
 # ... add more chains as needed
 
 # Deploy
@@ -44,6 +48,29 @@ wrangler deploy
 | `POST` | `/webhook/goldsky` | Goldsky Mirror webhook |
 | `GET` | `/health` | Health check |
 | `GET` | `/status` | Order counts by status |
+
+## Goldsky Pipeline Sync
+
+Use these scripts to keep Goldsky transfer pipelines aligned with active collections:
+
+```bash
+# One-shot sync (apply changes)
+npm run sync-goldsky
+
+# Preview generated YAML only
+npm run sync-goldsky:dry
+
+# Near-realtime watcher with debounced sync
+npm run sync-goldsky:watch
+```
+
+Useful flags for `scripts/sync-goldsky-pipelines.ts`:
+
+- `--list` show current Goldsky pipelines
+- `--dry-run` print YAML without applying
+- `--state-file <path>` skip apply when collection set is unchanged
+- `--force` ignore state-file short-circuit
+- `--strict` fail if any unsupported chains are skipped
 
 ## Architecture
 

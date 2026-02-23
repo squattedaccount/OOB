@@ -49,6 +49,13 @@ function validatePositiveBigInt(value: string | bigint, label: string): void {
   }
 }
 
+function validateBps(value: number | undefined, label: string): void {
+  if (value === undefined || value === 0) return;
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > 10000) {
+    throw new Error(`Invalid ${label}: must be an integer between 0 and 10000 (got ${value})`);
+  }
+}
+
 export class OpenOrderBook {
   readonly config: Required<OobConfig>;
   readonly api: ApiClient;
@@ -58,6 +65,7 @@ export class OpenOrderBook {
   private publicClient?: PublicClient;
 
   constructor(config: OobConfig) {
+    validateBps(config.feeBps, "feeBps");
     if ((config.feeBps ?? DEFAULT_FEE_BPS) > 0 && !(config.feeRecipient ?? DEFAULT_FEE_RECIPIENT)) {
       throw new Error("Invalid config: feeRecipient is required when feeBps > 0");
     }
@@ -213,6 +221,7 @@ export class OpenOrderBook {
     validatePositiveBigInt(params.priceWei, "priceWei");
     if (params.currency) validateAddress(params.currency, "currency");
     if (params.royaltyRecipient) validateAddress(params.royaltyRecipient, "royaltyRecipient");
+    validateBps(params.royaltyBps, "royaltyBps");
 
     const { wallet, public: pub } = this.requireWallet();
 
@@ -255,6 +264,7 @@ export class OpenOrderBook {
     validateAddress(params.currency, "currency");
     validatePositiveBigInt(params.amountWei, "amountWei");
     if (params.royaltyRecipient) validateAddress(params.royaltyRecipient, "royaltyRecipient");
+    validateBps(params.royaltyBps, "royaltyBps");
 
     const { wallet, public: pub } = this.requireWallet();
 
@@ -313,12 +323,9 @@ export class OpenOrderBook {
     const filler = wallet.account!.address as Address;
 
     if (order.orderType === "offer") {
-      // Seller accepting an offer: needs NFT approval + ERC20 approval for fees.
-      // Seaport pulls the NFT from the seller and also pulls ERC20 fee payments
-      // from the seller via transferFrom (even though the seller receives ERC20
-      // from the offerer in the same tx, allowance is still required).
-
-      // 1. Check NFT approval
+      // Seller accepting an offer: only needs NFT approval.
+      // Fee consideration items are funded from the offerer's ERC20 offer amount
+      // by Seaport during execution — the seller does not need ERC20 allowance.
       const nftApproved = await this.seaport.isApprovedForAll(
         order.nftContract as Address,
         filler,
@@ -330,36 +337,6 @@ export class OpenOrderBook {
           order.nftContract,
           "NFT collection is not approved for Seaport. Call oob.approveCollection() first.",
         );
-      }
-
-      // 2. Check ERC20 approval for fee consideration items the seller must pay
-      const considerationItems = order.orderJson.consideration || [];
-      let totalErc20FeesWei = 0n;
-      let feeToken = "";
-      for (const item of considerationItems) {
-        if (Number(item.itemType) === 1) { // ERC20
-          const recipient = (item.recipient || "").toLowerCase();
-          if (recipient !== filler.toLowerCase()) {
-            totalErc20FeesWei += BigInt(item.startAmount);
-            if (!feeToken) feeToken = item.token;
-          }
-        }
-      }
-
-      if (totalErc20FeesWei > 0n && feeToken) {
-        const readiness = await this.seaport.checkErc20Readiness(
-          feeToken as Address,
-          filler,
-          totalErc20FeesWei,
-          pub,
-        );
-        if (!readiness.hasAllowance) {
-          throw new NeedsApprovalError(
-            "erc20",
-            feeToken,
-            `ERC20 approval needed to pay fees when accepting offer. The seller must approve Seaport to spend ${feeToken}. Call oob.approveErc20('${feeToken}') first.`,
-          );
-        }
       }
     } else {
       // Buyer filling a listing: check they can pay

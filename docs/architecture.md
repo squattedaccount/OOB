@@ -87,11 +87,19 @@ A Cloudflare Worker that serves the public REST API.
 |---|---|---|
 | GET | `/v1/orders` | Query orders with filters |
 | GET | `/v1/orders/:hash` | Get single order |
+| GET | `/v1/orders/:hash/activity` | Get order activity timeline |
+| GET | `/v1/orders/:hash/fill-tx` | Build single-order fill calldata |
 | GET | `/v1/orders/best-listing` | Cheapest active listing |
+| GET | `/v1/orders/best-listing/fill-tx` | Build floor-snipe fill calldata |
 | GET | `/v1/orders/best-offer` | Highest active offer |
 | POST | `/v1/orders` | Submit a signed order |
+| POST | `/v1/orders/batch` | Batch submit up to 20 orders |
+| POST | `/v1/orders/batch/fill-tx` | Build sweep fill calldata (up to 20) |
 | DELETE | `/v1/orders/:hash` | Cancel an order |
+| DELETE | `/v1/orders/batch` | Batch cancel up to 20 orders |
 | GET | `/v1/collections/:addr/stats` | Collection statistics |
+| GET | `/v1/erc20/:token/approve-tx` | Build ERC20 approve calldata for Seaport |
+| GET | `/v1/config` | Protocol fee config |
 | WSS | `/v1/stream` | Real-time event stream |
 | GET | `/health` | Health check |
 
@@ -104,15 +112,18 @@ TypeScript/JavaScript SDK for interacting with the API and Seaport contracts.
 - **Dual build**: ESM + CJS with TypeScript declarations
 - **Tree-shakeable**: Only import what you use
 
-### OOB Indexer (planned)
+### OOB Indexer (`packages/indexer/`)
 
-A separate Cloudflare Worker that monitors on-chain Seaport events:
+A standalone Cloudflare Worker that keeps order status in sync with on-chain state.
 
-- `OrderFulfilled` — marks orders as `filled`, records tx hash
-- `OrderCancelled` — marks orders as `cancelled`
-- `Transfer` (ERC721/ERC1155) — detects NFT transfers that make listings stale
-
-This runs on a cron schedule (every 1-5 minutes) and updates the database.
+- **Webhook ingest**: accepts Alchemy, Moralis, and Goldsky payloads
+- **Seaport lifecycle updates**:
+  - `OrderFulfilled` → marks orders `filled`
+  - `OrderCancelled` → marks orders `cancelled`
+  - `CounterIncremented` → bulk-cancels active orders for an offerer on that chain
+- **Transfer-based staleness**: decodes ERC-721 `Transfer` logs and marks matching listings as `stale` when the lister transfers the NFT away
+- **Scheduled cron**: expires orders past `end_time`, plus performs round-robin ownership checks for active ERC-721 listings
+- **Goldsky sync tooling**: scripts generate/apply per-chain transfer pipelines from currently active collections
 
 ---
 
@@ -370,13 +381,15 @@ Orders can become invalid after submission:
 
 The OOB Indexer handles this:
 
-1. **Cron job** (every 1-5 minutes) checks active orders
-2. For each active order, verify:
-   - NFT still owned by offerer (for listings)
-   - Seaport still approved (for listings)
-   - ERC20 balance sufficient (for offers)
-   - Order not filled on-chain
-3. Mark invalid orders as `stale`
+1. **Webhook path (near real-time):**
+   - Indexer decodes ERC-721 `Transfer` logs.
+   - If `(chainId, nftContract, tokenId, from)` matches an active listing's `(chain_id, nft_contract, token_id, offerer)`, that listing is marked `stale` immediately.
+2. **Cron path (backstop):**
+   - Every run selects a batch of active ERC-721 listings ordered by `stale_checked_at ASC NULLS FIRST`.
+   - Ownership is checked via one Multicall3 request per chain when available (fallback: individual RPC calls).
+   - Listings that no longer match owner-of are marked `stale`.
+   - Checked rows get `stale_checked_at = NOW()` to advance the round-robin cursor.
+3. **Result:** stale listings are removed from active results while preserving historical rows.
 
 Stale orders are excluded from `active` queries but kept in the database for history.
 
@@ -492,35 +505,46 @@ You can run your own Open Order Book instance. Here's how.
 
 ```bash
 git clone https://github.com/openorderbook/sdk.git
-cd sdk/oob-api
+cd sdk
 npm install
 ```
 
 ### Step 2: Create database
 
-Create a Neon project and run the migration:
-
-```sql
--- Copy from migrations/001_seaport_orders.sql
-CREATE TABLE seaport_orders ( ... );
--- Create indexes
-CREATE INDEX ...;
-```
-
-### Step 3: Configure secrets
+Create a Neon project, then run API migrations:
 
 ```bash
+DATABASE_URL=postgres://... npx tsx packages/api/scripts/migrate.ts
+```
+
+This applies all SQL files in `packages/api/migrations/` and tracks them in `_migrations`.
+
+### Step 3: Configure worker secrets/vars
+
+```bash
+# API worker
 wrangler secret put DATABASE_URL
-# Paste your Neon connection string
+wrangler secret put PROTOCOL_FEE_RECIPIENT
+
+# Optional API vars
+# RATE_LIMIT_PUBLIC_READS, RATE_LIMIT_PUBLIC_WRITES,
+# RATE_LIMIT_REGISTERED_READS, RATE_LIMIT_REGISTERED_WRITES,
+# API_KEYS, DO_SHARD_COUNT
+
+# Indexer worker
+wrangler secret put DATABASE_URL
+wrangler secret put WEBHOOK_SECRET
+# plus RPC_URL_<CHAIN> secrets for cron ownership checks
 ```
 
-### Step 4: Deploy
+### Step 4: Deploy workers
 
 ```bash
-wrangler deploy
+cd packages/api && wrangler deploy
+cd packages/indexer && wrangler deploy
 ```
 
-Your API is now live at `https://oob-api.<your-subdomain>.workers.dev`.
+Your API and indexer are now live on Workers.
 
 ### Step 5: Custom domain (optional)
 

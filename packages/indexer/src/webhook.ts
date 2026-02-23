@@ -330,8 +330,14 @@ export async function handleWebhook(
   }
 
   // Cross-instance replay protection via shared DB.
-  // Use provider delivery ID if available, otherwise compute event fingerprint.
-  const deliveryId = body?.id || request.headers.get("x-webhook-id") || "";
+  // Only use provider-supplied delivery IDs from headers (never from body — body is
+  // attacker-influenced and could be used to suppress legitimate events by pre-sending
+  // a fake payload with the same ID). Fall back to a content fingerprint, and if that
+  // is also empty (unusual payload structure), skip dedup rather than block processing.
+  const deliveryId = request.headers.get("x-alchemy-webhook-id")
+    || request.headers.get("x-webhook-id")
+    || request.headers.get("x-goldsky-webhook-id")
+    || "";
   const dedupKey = deliveryId
     ? `wh:${deliveryId}`
     : computeEventFingerprint(body, request.headers);

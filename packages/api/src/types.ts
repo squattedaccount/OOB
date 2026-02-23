@@ -21,6 +21,40 @@ export interface Env {
   // Number of DO shards per room (default 1). Increase for high-traffic collections.
   // Each shard is a separate DO instance; broadcaster fans out to all shards.
   DO_SHARD_COUNT?: string;
+  // Upstash Redis for hot cache
+  UPSTASH_REDIS_REST_URL?: string;
+  UPSTASH_REDIS_REST_TOKEN?: string;
+  // Cloudflare Queue for write-behind order ingestion (optional)
+  ORDER_INGEST_QUEUE?: Queue<OrderIngestMessage>;
+  // RPC URLs for on-chain validation (ownerOf check in fill-tx)
+  RPC_URL_ETHEREUM?: string;
+  RPC_URL_BASE?: string;
+  RPC_URL_BASE_SEPOLIA?: string;
+  RPC_URL_HYPERLIQUID?: string;
+  RPC_URL_RONIN?: string;
+  RPC_URL_RONIN_TESTNET?: string;
+  RPC_URL_ABSTRACT?: string;
+}
+
+export interface OrderIngestMessage {
+  chainId: number;
+  order: any;
+  signature: string;
+  orderHash: string;
+  orderType: string;
+  nftContract: string;
+  tokenId: string;
+  tokenStandard: string;
+  priceWei: string;
+  currency: string;
+  offerer: string;
+  zone: string;
+  startTime: number;
+  endTime: number;
+  feeRecipient: string;
+  feeBps: number;
+  royaltyRecipient: string | null;
+  royaltyBps: number;
 }
 
 export interface RouteContext {

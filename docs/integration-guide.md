@@ -43,6 +43,8 @@ Yes. Cancellation requires a small gas transaction to the Seaport contract. This
 - The signed order can only be used to execute the exact trade you agreed to (specific NFT, specific price, specific fees)
 - The Seaport smart contract is deployed by OpenSea, audited by multiple firms, and is immutable (can't be changed)
 
+If your listed NFT moves out of your wallet, the indexer marks that listing as `stale` so buyers won't see it as active.
+
 ---
 
 ## For Marketplace Builders
@@ -372,7 +374,7 @@ Created (signed)
     │
     ├── Active ──── Expired (endTime passed)
     │
-    └── Active ──── Stale (NFT transferred, approval revoked, etc.)
+    └── Active ──── Stale (lister no longer owns the NFT)
 ```
 
 **Status definitions:**
@@ -383,7 +385,7 @@ Created (signed)
 | `filled` | Order was successfully filled on-chain |
 | `cancelled` | Order was cancelled via on-chain transaction |
 | `expired` | Order's `endTime` has passed |
-| `stale` | Order is technically invalid (NFT moved, approval revoked) but not yet cancelled on-chain |
+| `stale` | Listing is no longer fillable because ownership no longer matches the lister (detected by transfer webhooks + cron backstop) |
 
 ---
 

@@ -2,14 +2,21 @@
  * Order routes — GET, POST, DELETE for /v1/orders
  */
 
-import type { RouteContext } from "../types.js";
+import type { RouteContext, Env } from "../types.js";
 import type { SqlClient } from "../db.js";
 import { getPooledSqlClient } from "../db.js";
 import { jsonResponse, jsonError } from "../response.js";
 import { computeOrderHash } from "../seaportHash.js";
 import { logActivity } from "../activity.js";
 import { resolveCurrency, formatPriceDecimal } from "../currency.js";
-import { ethers } from "ethers";
+import { RedisCache, CacheKeys, getCacheConfig, hashQueryParams } from "../cache.js";
+import {
+  recoverTypedDataAddress,
+  recoverMessageAddress,
+  encodeFunctionData,
+  type Address,
+  type Hex,
+} from "viem";
 
 // ─── Validation Helpers ─────────────────────────────────────────────────────
 
@@ -30,6 +37,180 @@ function isValidChainId(raw: unknown): raw is number {
 }
 
 const MAX_BATCH_SIZE = 20;
+
+// ─── Seaport EIP-712 Signature Verification ─────────────────────────────────
+
+const SEAPORT_EIP712_DOMAIN = {
+  name: "Seaport" as const,
+  version: "1.6" as const,
+  verifyingContract: "0x0000000000000068F116a894984e2DB1123eB395" as Address,
+};
+
+const SEAPORT_EIP712_TYPES = {
+  OrderComponents: [
+    { name: "offerer", type: "address" },
+    { name: "zone", type: "address" },
+    { name: "offer", type: "OfferItem[]" },
+    { name: "consideration", type: "ConsiderationItem[]" },
+    { name: "orderType", type: "uint8" },
+    { name: "startTime", type: "uint256" },
+    { name: "endTime", type: "uint256" },
+    { name: "zoneHash", type: "bytes32" },
+    { name: "salt", type: "uint256" },
+    { name: "conduitKey", type: "bytes32" },
+    { name: "counter", type: "uint256" },
+  ],
+  OfferItem: [
+    { name: "itemType", type: "uint8" },
+    { name: "token", type: "address" },
+    { name: "identifierOrCriteria", type: "uint256" },
+    { name: "startAmount", type: "uint256" },
+    { name: "endAmount", type: "uint256" },
+  ],
+  ConsiderationItem: [
+    { name: "itemType", type: "uint8" },
+    { name: "token", type: "address" },
+    { name: "identifierOrCriteria", type: "uint256" },
+    { name: "startAmount", type: "uint256" },
+    { name: "endAmount", type: "uint256" },
+    { name: "recipient", type: "address" },
+  ],
+} as const;
+
+async function recoverSeaportOrderSigner(
+  chainId: number,
+  order: any,
+  signature: Hex,
+): Promise<string> {
+  const recovered = await recoverTypedDataAddress({
+    domain: { ...SEAPORT_EIP712_DOMAIN, chainId },
+    types: SEAPORT_EIP712_TYPES,
+    primaryType: "OrderComponents",
+    message: order,
+    signature,
+  });
+  return recovered.toLowerCase();
+}
+
+async function recoverCancelSigner(
+  message: string,
+  signature: Hex,
+): Promise<string> {
+  const recovered = await recoverMessageAddress({
+    message,
+    signature,
+  });
+  return recovered.toLowerCase();
+}
+
+// ─── Seaport ABI for calldata encoding ──────────────────────────────────────
+
+const OFFER_ITEM_TUPLE = {
+  type: "tuple" as const,
+  components: [
+    { name: "itemType", type: "uint8" as const },
+    { name: "token", type: "address" as const },
+    { name: "identifierOrCriteria", type: "uint256" as const },
+    { name: "startAmount", type: "uint256" as const },
+    { name: "endAmount", type: "uint256" as const },
+  ],
+};
+
+const CONSIDERATION_ITEM_TUPLE = {
+  type: "tuple" as const,
+  components: [
+    { name: "itemType", type: "uint8" as const },
+    { name: "token", type: "address" as const },
+    { name: "identifierOrCriteria", type: "uint256" as const },
+    { name: "startAmount", type: "uint256" as const },
+    { name: "endAmount", type: "uint256" as const },
+    { name: "recipient", type: "address" as const },
+  ],
+};
+
+const ORDER_PARAMETERS_TUPLE = {
+  type: "tuple" as const,
+  components: [
+    { name: "offer", type: "tuple[]" as const, components: OFFER_ITEM_TUPLE.components },
+    { name: "consideration", type: "tuple[]" as const, components: CONSIDERATION_ITEM_TUPLE.components },
+    { name: "orderType", type: "uint8" as const },
+    { name: "startTime", type: "uint256" as const },
+    { name: "endTime", type: "uint256" as const },
+    { name: "zoneHash", type: "bytes32" as const },
+    { name: "salt", type: "uint256" as const },
+    { name: "conduitKey", type: "bytes32" as const },
+    { name: "totalOriginalConsiderationItems", type: "uint256" as const },
+  ],
+};
+
+const SEAPORT_FULFILL_ORDER_ABI = [
+  {
+    name: "fulfillOrder",
+    type: "function" as const,
+    stateMutability: "payable" as const,
+    inputs: [
+      {
+        name: "order",
+        type: "tuple" as const,
+        components: [
+          { name: "parameters", ...ORDER_PARAMETERS_TUPLE },
+          { name: "signature", type: "bytes" as const },
+        ],
+      },
+      { name: "fulfillerConduitKey", type: "bytes32" as const },
+    ],
+    outputs: [{ name: "fulfilled", type: "bool" as const }],
+  },
+] as const;
+
+const CRITERIA_RESOLVER_TUPLE = {
+  type: "tuple" as const,
+  components: [
+    { name: "orderIndex", type: "uint256" as const },
+    { name: "side", type: "uint8" as const },
+    { name: "index", type: "uint256" as const },
+    { name: "identifier", type: "uint256" as const },
+    { name: "criteriaProof", type: "bytes32[]" as const },
+  ],
+};
+
+const SEAPORT_FULFILL_ADVANCED_ORDER_ABI = [
+  {
+    name: "fulfillAdvancedOrder",
+    type: "function" as const,
+    stateMutability: "payable" as const,
+    inputs: [
+      {
+        name: "advancedOrder",
+        type: "tuple" as const,
+        components: [
+          { name: "parameters", ...ORDER_PARAMETERS_TUPLE },
+          { name: "numerator", type: "uint120" as const },
+          { name: "denominator", type: "uint120" as const },
+          { name: "signature", type: "bytes" as const },
+          { name: "extraData", type: "bytes" as const },
+        ],
+      },
+      { name: "criteriaResolvers", type: "tuple[]" as const, components: CRITERIA_RESOLVER_TUPLE.components },
+      { name: "fulfillerConduitKey", type: "bytes32" as const },
+      { name: "recipient", type: "address" as const },
+    ],
+    outputs: [{ name: "fulfilled", type: "bool" as const }],
+  },
+] as const;
+
+const ERC20_APPROVE_ABI = [
+  {
+    name: "approve",
+    type: "function" as const,
+    stateMutability: "nonpayable" as const,
+    inputs: [
+      { name: "spender", type: "address" as const },
+      { name: "amount", type: "uint256" as const },
+    ],
+    outputs: [{ name: "", type: "bool" as const }],
+  },
+] as const;
 
 // ─── WebSocket Broadcast Helper ─────────────────────────────────────────────
 
@@ -263,8 +444,8 @@ function validateFeeEnforcement(
   }
 
   const minFeeBps = Number(env.PROTOCOL_FEE_BPS || "50"); // default 0.5%
-  if (minFeeBps <= 0) {
-    return "Protocol fee BPS must be greater than zero";
+  if (!Number.isFinite(minFeeBps) || !Number.isInteger(minFeeBps) || minFeeBps <= 0 || minFeeBps > 10000) {
+    return "Protocol fee BPS misconfigured: must be an integer between 1 and 10000";
   }
 
   const offerItems: any[] = order.offer || [];
@@ -385,7 +566,7 @@ function mapRowToOrder(row: any) {
     filledAt: row.filled_at || null,
     cancelledTxHash: row.cancelled_tx_hash || null,
     cancelledAt: row.cancelled_at || null,
-    orderJson: typeof row.order_json === "string" ? JSON.parse(row.order_json) : row.order_json,
+    orderJson: (() => { try { return typeof row.order_json === "string" ? JSON.parse(row.order_json) : row.order_json; } catch { return null; } })(),
     signature: row.signature,
   };
 }
@@ -419,7 +600,7 @@ export async function handleGetOrders(ctx: RouteContext): Promise<Response> {
   const status = params.get("status") || "active";
   const sortBy = params.get("sortBy") || "created_at_desc";
   const limit = Math.min(Math.max(Number(params.get("limit") || 50), 1), 100);
-  const offset = Math.max(Number(params.get("offset") || 0), 0);
+  const offset = Math.min(Math.max(Number(params.get("offset") || 0), 0), 10000);
   const cursor = params.get("cursor"); // base64-encoded cursor for keyset pagination
 
   const sql = getPooledSqlClient(ctx.env);
@@ -475,6 +656,16 @@ export async function handleGetOrders(ctx: RouteContext): Promise<Response> {
       cursorDecoded = JSON.parse(atob(cursor));
     } catch {
       return jsonError(400, "Invalid cursor format");
+    }
+    // Validate cursor fields match the requested sortBy to prevent silent pagination restart
+    const isPriceCursor = !!(cursorDecoded?.price_wei && cursorDecoded?.order_hash);
+    const isTimeCursor = !!(cursorDecoded?.created_at && cursorDecoded?.order_hash);
+    const needsPriceCursor = sortBy === "price_asc" || sortBy === "price_desc";
+    if (needsPriceCursor && !isPriceCursor) {
+      return jsonError(400, "Cursor is not compatible with the requested sortBy (expected price cursor)");
+    }
+    if (!needsPriceCursor && !isTimeCursor) {
+      return jsonError(400, "Cursor is not compatible with the requested sortBy (expected created_at cursor)");
     }
   }
 
@@ -558,18 +749,51 @@ export async function handleGetOrder(ctx: RouteContext): Promise<Response> {
   if (!orderHash) return jsonError(400, "Missing order hash");
   if (!ORDER_HASH_RE.test(orderHash)) return jsonError(400, "Invalid order hash format");
 
-  const sql = getPooledSqlClient(ctx.env);
-
+  // Try cache first
   try {
-    const rows = await sql`
-      SELECT * FROM seaport_orders WHERE order_hash = ${orderHash}
-    `;
-    if (rows.length === 0) return jsonError(404, "Order not found");
+    const cache = new RedisCache(ctx.env);
+    const cacheKey = CacheKeys.order(orderHash);
+    
+    const cachedResult = await cache.getOrSet(
+      cacheKey,
+      async () => {
+        const sql = getPooledSqlClient(ctx.env);
+        const rows = await sql`
+          SELECT * FROM seaport_orders WHERE order_hash = ${orderHash}
+        `;
+        
+        if (rows.length === 0) {
+          return { order: null, notFound: true };
+        }
+        
+        return { order: mapRowToOrder(rows[0]), notFound: false };
+      },
+      getCacheConfig("order"),
+      (data) => !data.notFound, // never cache not-found — order may be submitted moments later
+    );
 
-    return jsonResponse({ order: mapRowToOrder(rows[0]) });
-  } catch (err: any) {
-    console.error("[oob-api] Failed to fetch order:", err);
-    return jsonError(500, "Failed to fetch order");
+    if (cachedResult.notFound) {
+      return jsonError(404, "Order not found");
+    }
+    
+    return jsonResponse({ order: cachedResult.order });
+  } catch (cacheErr) {
+    console.warn("[oob-api] Cache unavailable for order lookup, falling back to DB:", cacheErr);
+    
+    // Fallback to direct DB query
+    const sql = getPooledSqlClient(ctx.env);
+
+    try {
+      const rows = await sql`
+        SELECT * FROM seaport_orders WHERE order_hash = ${orderHash}
+      `;
+      if (rows.length === 0) return jsonError(404, "Order not found");
+
+      return jsonResponse({ order: mapRowToOrder(rows[0]) });
+    } catch (err: any) {
+      console.error("[oob-api] Failed to fetch order:", err);
+      return jsonError(500, "Failed to fetch order");
+    }
   }
 }
 
@@ -589,40 +813,95 @@ export async function handleBestListing(ctx: RouteContext): Promise<Response> {
   }
   const chainId = Number(chainIdRaw);
 
-  const sql = getPooledSqlClient(ctx.env);
-  const now = Math.floor(Date.now() / 1000);
+  // Validate tokenId format — must be a decimal uint256 (1–78 digits)
+  if (tokenId && !/^\d{1,78}$/.test(tokenId)) {
+    return jsonError(400, "Invalid tokenId format");
+  }
 
+  // Try cache first
   try {
-    let rows;
-    if (tokenId) {
-      rows = await sql`
-        SELECT * FROM seaport_orders
-        WHERE chain_id = ${Number(chainId)}
-          AND nft_contract = ${collection}
-          AND token_id = ${tokenId}
-          AND order_type = 'listing'
-          AND status = 'active'
-          AND end_time > ${now}
-        ORDER BY CAST(price_wei AS NUMERIC) ASC
-        LIMIT 1
-      `;
-    } else {
-      rows = await sql`
-        SELECT * FROM seaport_orders
-        WHERE chain_id = ${Number(chainId)}
-          AND nft_contract = ${collection}
-          AND order_type = 'listing'
-          AND status = 'active'
-          AND end_time > ${now}
-        ORDER BY CAST(price_wei AS NUMERIC) ASC
-        LIMIT 1
-      `;
-    }
+    const cache = new RedisCache(ctx.env);
+    const cacheKey = tokenId 
+      ? `${CacheKeys.bestListing(String(chainId), collection)}:${tokenId}`
+      : CacheKeys.bestListing(String(chainId), collection);
+    
+    const cachedResult = await cache.getOrSet(
+      cacheKey,
+      async () => {
+        const sql = getPooledSqlClient(ctx.env);
+        const now = Math.floor(Date.now() / 1000);
+        
+        let rows;
+        if (tokenId) {
+          rows = await sql`
+            SELECT * FROM seaport_orders
+            WHERE chain_id = ${Number(chainId)}
+              AND nft_contract = ${collection}
+              AND token_id = ${tokenId}
+              AND order_type = 'listing'
+              AND status = 'active'
+              AND end_time > ${now}
+            ORDER BY CAST(price_wei AS NUMERIC) ASC
+            LIMIT 1
+          `;
+        } else {
+          rows = await sql`
+            SELECT * FROM seaport_orders
+            WHERE chain_id = ${Number(chainId)}
+              AND nft_contract = ${collection}
+              AND order_type = 'listing'
+              AND status = 'active'
+              AND end_time > ${now}
+            ORDER BY CAST(price_wei AS NUMERIC) ASC
+            LIMIT 1
+          `;
+        }
+        
+        return { order: rows.length > 0 ? mapRowToOrder(rows[0]) : null };
+      },
+      getCacheConfig("bestListing")
+    );
 
-    return jsonResponse({ order: rows.length > 0 ? mapRowToOrder(rows[0]) : null });
-  } catch (err: any) {
-    console.error("[oob-api] Failed to fetch best listing:", err);
-    return jsonError(500, "Failed to fetch best listing");
+    return jsonResponse(cachedResult);
+  } catch (cacheErr) {
+    console.warn("[oob-api] Cache unavailable for best listing, falling back to DB:", cacheErr);
+    
+    // Fallback to direct DB query
+    const sql = getPooledSqlClient(ctx.env);
+    const now = Math.floor(Date.now() / 1000);
+
+    try {
+      let rows;
+      if (tokenId) {
+        rows = await sql`
+          SELECT * FROM seaport_orders
+          WHERE chain_id = ${Number(chainId)}
+            AND nft_contract = ${collection}
+            AND token_id = ${tokenId}
+            AND order_type = 'listing'
+            AND status = 'active'
+            AND end_time > ${now}
+          ORDER BY CAST(price_wei AS NUMERIC) ASC
+          LIMIT 1
+        `;
+      } else {
+        rows = await sql`
+          SELECT * FROM seaport_orders
+          WHERE chain_id = ${Number(chainId)}
+            AND nft_contract = ${collection}
+            AND order_type = 'listing'
+            AND status = 'active'
+            AND end_time > ${now}
+          ORDER BY CAST(price_wei AS NUMERIC) ASC
+          LIMIT 1
+        `;
+      }
+
+      return jsonResponse({ order: rows.length > 0 ? mapRowToOrder(rows[0]) : null });
+    } catch (err: any) {
+      console.error("[oob-api] Failed to fetch best listing:", err);
+      return jsonError(500, "Failed to fetch best listing");
+    }
   }
 }
 
@@ -639,6 +918,12 @@ export async function handleBestOffer(ctx: RouteContext): Promise<Response> {
   }
   if (!isValidChainId(chainIdRaw)) {
     return jsonError(400, "Invalid chainId parameter");
+  }
+  if (!isValidAddress(collection)) {
+    return jsonError(400, "Invalid collection address");
+  }
+  if (tokenId && !/^\d{1,78}$/.test(tokenId)) {
+    return jsonError(400, "Invalid tokenId format");
   }
   const chainId = Number(chainIdRaw);
 
@@ -732,46 +1017,8 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
 
   // Verify EIP-712 signature matches offerer
   try {
-    // ethers is now a static top-level import
-    // Reconstruct the EIP-712 domain and types for Seaport v1.6
-    const domain = {
-      name: "Seaport",
-      version: "1.6",
-      chainId: Number(chainId),
-      verifyingContract: "0x0000000000000068F116a894984e2DB1123eB395",
-    };
-    const types = {
-      OrderComponents: [
-        { name: "offerer", type: "address" },
-        { name: "zone", type: "address" },
-        { name: "offer", type: "OfferItem[]" },
-        { name: "consideration", type: "ConsiderationItem[]" },
-        { name: "orderType", type: "uint8" },
-        { name: "startTime", type: "uint256" },
-        { name: "endTime", type: "uint256" },
-        { name: "zoneHash", type: "bytes32" },
-        { name: "salt", type: "uint256" },
-        { name: "conduitKey", type: "bytes32" },
-        { name: "counter", type: "uint256" },
-      ],
-      OfferItem: [
-        { name: "itemType", type: "uint8" },
-        { name: "token", type: "address" },
-        { name: "identifierOrCriteria", type: "uint256" },
-        { name: "startAmount", type: "uint256" },
-        { name: "endAmount", type: "uint256" },
-      ],
-      ConsiderationItem: [
-        { name: "itemType", type: "uint8" },
-        { name: "token", type: "address" },
-        { name: "identifierOrCriteria", type: "uint256" },
-        { name: "startAmount", type: "uint256" },
-        { name: "endAmount", type: "uint256" },
-        { name: "recipient", type: "address" },
-      ],
-    };
-    const recovered = ethers.verifyTypedData(domain, types, order, signature);
-    if (recovered.toLowerCase() !== offerer) {
+    const recovered = await recoverSeaportOrderSigner(Number(chainId), order, signature as Hex);
+    if (recovered !== offerer) {
       return jsonError(400, "Signature does not match offerer");
     }
   } catch (sigErr: any) {
@@ -803,22 +1050,24 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
   const sql = getPooledSqlClient(ctx.env);
 
   try {
-    // Check for duplicate
-    const existing = await sql`
-      SELECT order_hash FROM seaport_orders WHERE order_hash = ${orderHash}
-    `;
-    if (existing.length > 0) {
+    // Redis-based deduplication check (faster than DB)
+    const dedupResult = await new RedisCache(ctx.env).deduplicate(orderHash, 300).catch(() => "error" as const);
+
+    if (dedupResult === "duplicate") {
       return jsonResponse({ orderHash, status: "active", duplicate: true });
     }
 
-    // Per-offerer active order limit (prevent DB spam)
-    const activeCount = await sql`
-      SELECT COUNT(*)::int as cnt FROM seaport_orders
-      WHERE offerer = ${offerer} AND status = 'active'
-    `;
-    if (Number(activeCount[0]?.cnt || 0) >= MAX_ACTIVE_ORDERS_PER_OFFERER) {
-      return jsonError(429, `Too many active orders for this offerer (max ${MAX_ACTIVE_ORDERS_PER_OFFERER})`);
+    if (dedupResult === "error") {
+      // Redis unavailable — fall back to DB check so valid orders are never wrongly rejected
+      console.warn("[oob-api] Redis deduplication unavailable, falling back to DB check");
+      const existing = await sql`
+        SELECT order_hash FROM seaport_orders WHERE order_hash = ${orderHash}
+      `;
+      if (existing.length > 0) {
+        return jsonResponse({ orderHash, status: "active", duplicate: true });
+      }
     }
+    // dedupResult === "new" → proceed normally
 
     // Prevent duplicate active listings for the same token by the same offerer
     if (orderType === "listing") {
@@ -837,7 +1086,40 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
       }
     }
 
-    await sql`
+    // Write path: enqueue (async, 202) if queue is configured, else direct DB write (sync, 201)
+    if (ctx.env.ORDER_INGEST_QUEUE) {
+      await ctx.env.ORDER_INGEST_QUEUE.send({
+        chainId: Number(chainId),
+        order,
+        signature,
+        orderHash,
+        orderType,
+        nftContract,
+        tokenId,
+        tokenStandard,
+        priceWei: priceWei.toString(),
+        currency,
+        offerer,
+        zone,
+        startTime,
+        endTime,
+        feeRecipient,
+        feeBps,
+        royaltyRecipient: royaltyRecipient || null,
+        royaltyBps,
+      });
+
+      // Broadcast to WebSocket clients (fire-and-forget)
+      broadcastOrderEvent(ctx.env, orderType === "listing" ? "new_listing" : "new_offer", {
+        orderHash, chainId: Number(chainId), nftContract, tokenId, offerer,
+        priceWei: priceWei.toString(), currency, orderType,
+      });
+
+      return jsonResponse({ orderHash, status: "queued" }, 202);
+    }
+
+    // Synchronous path (no queue configured): direct DB write with per-offerer cap enforcement
+    const insertResult = await sql`
       INSERT INTO seaport_orders (
         order_hash, chain_id, order_type, offerer, zone,
         nft_contract, token_id, token_standard,
@@ -847,7 +1129,8 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
         order_json, signature,
         start_time, end_time,
         status
-      ) VALUES (
+      )
+      SELECT
         ${orderHash}, ${Number(chainId)}, ${orderType}, ${offerer}, ${zone},
         ${nftContract}, ${tokenId}, ${tokenStandard},
         ${priceWei.toString()}, ${currency},
@@ -856,8 +1139,15 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
         ${JSON.stringify(order)}, ${signature},
         ${startTime}, ${endTime},
         'active'
-      )
+      WHERE (
+        SELECT COUNT(*)::int FROM seaport_orders
+        WHERE offerer = ${offerer} AND status = 'active'
+      ) < ${MAX_ACTIVE_ORDERS_PER_OFFERER}
+      RETURNING order_hash
     `;
+    if (!insertResult || insertResult.length === 0) {
+      return jsonError(429, `Too many active orders for this offerer (max ${MAX_ACTIVE_ORDERS_PER_OFFERER})`);
+    }
 
     // Log activity
     await logActivity(sql, {
@@ -870,6 +1160,19 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
       priceWei: priceWei.toString(),
       currency,
     });
+
+    // Invalidate related cache entries
+    try {
+      const cache = new RedisCache(ctx.env);
+      const chainIdStr = String(chainId);
+      await Promise.all([
+        cache.del(CacheKeys.allBestListings(chainIdStr, nftContract)),
+        cache.del(CacheKeys.allCollectionStats(chainIdStr, nftContract)),
+        cache.del(CacheKeys.allOrdersLists(chainIdStr, nftContract)),
+      ]);
+    } catch (cacheErr) {
+      console.warn("[oob-api] Cache invalidation failed for order submission:", cacheErr);
+    }
 
     // Broadcast to WebSocket clients (fire-and-forget)
     broadcastOrderEvent(ctx.env, orderType === "listing" ? "new_listing" : "new_offer", {
@@ -923,10 +1226,9 @@ export async function handleCancelOrder(ctx: RouteContext): Promise<Response> {
 
   // Verify EIP-191 personal_sign: sign("cancel:" + orderHash)
   try {
-    // ethers is now a static top-level import
     const message = `cancel:${orderHash}`;
-    const recovered = ethers.verifyMessage(message, cancelSig);
-    if (recovered.toLowerCase() !== orderRows[0].offerer.toLowerCase()) {
+    const recovered = await recoverCancelSigner(message, cancelSig as Hex);
+    if (recovered !== orderRows[0].offerer.toLowerCase()) {
       return jsonError(403, "Cancel signature does not match order offerer");
     }
   } catch {
@@ -959,6 +1261,25 @@ export async function handleCancelOrder(ctx: RouteContext): Promise<Response> {
       txHash: null,
     });
 
+    // Invalidate related cache entries
+    try {
+      const cache = new RedisCache(ctx.env);
+      const chainId = String(orderRows[0].chain_id || 0);
+      const collection = orderRows[0].nft_contract;
+      
+      // Invalidate order-specific cache
+      await cache.del(CacheKeys.order(orderHash));
+      
+      // Invalidate collection-related caches
+      await Promise.all([
+        cache.del(CacheKeys.allBestListings(chainId, collection)),
+        cache.del(CacheKeys.allCollectionStats(chainId, collection)),
+        cache.del(CacheKeys.allOrdersLists(chainId, collection)),
+      ]);
+    } catch (cacheErr) {
+      console.warn("[oob-api] Cache invalidation failed for order cancellation:", cacheErr);
+    }
+
     // Broadcast to WebSocket clients (fire-and-forget)
     broadcastOrderEvent(ctx.env, "cancellation", {
       orderHash, chainId: orderRows[0].chain_id || 0,
@@ -986,48 +1307,105 @@ export async function handleCollectionStats(ctx: RouteContext): Promise<Response
   if (!isValidChainId(chainIdRaw)) {
     return jsonError(400, "Invalid chainId parameter");
   }
+  if (!isValidAddress(collection)) {
+    return jsonError(400, "Invalid collection address");
+  }
   const chainId = Number(chainIdRaw);
 
-  const sql = getPooledSqlClient(ctx.env);
-  const now = Math.floor(Date.now() / 1000);
-
+  // Try cache first
   try {
-    const [listingStats, offerStats] = await Promise.all([
-      sql`
-        SELECT
-          COUNT(*) as listing_count,
-          MIN(CAST(price_wei AS NUMERIC)) as floor_price_wei
-        FROM seaport_orders
-        WHERE chain_id = ${Number(chainId)}
-          AND nft_contract = ${collection}
-          AND order_type = 'listing'
-          AND status = 'active'
-          AND end_time > ${now}
-      `,
-      sql`
-        SELECT
-          COUNT(*) as offer_count,
-          MAX(CAST(price_wei AS NUMERIC)) as best_offer_wei
-        FROM seaport_orders
-        WHERE chain_id = ${Number(chainId)}
-          AND nft_contract = ${collection}
-          AND order_type = 'offer'
-          AND status = 'active'
-          AND end_time > ${now}
-      `,
-    ]);
+    const cache = new RedisCache(ctx.env);
+    const cacheKey = CacheKeys.collectionStats(String(chainId), collection);
+    
+    const cachedResult = await cache.getOrSet(
+      cacheKey,
+      async () => {
+        const sql = getPooledSqlClient(ctx.env);
+        const now = Math.floor(Date.now() / 1000);
+        
+        const [listingStats, offerStats] = await Promise.all([
+          sql`
+            SELECT
+              COUNT(*) as listing_count,
+              MIN(CAST(price_wei AS NUMERIC)) as floor_price_wei
+            FROM seaport_orders
+            WHERE chain_id = ${Number(chainId)}
+              AND nft_contract = ${collection}
+              AND order_type = 'listing'
+              AND status = 'active'
+              AND end_time > ${now}
+          `,
+          sql`
+            SELECT
+              COUNT(*) as offer_count,
+              MAX(CAST(price_wei AS NUMERIC)) as best_offer_wei
+            FROM seaport_orders
+            WHERE chain_id = ${Number(chainId)}
+              AND nft_contract = ${collection}
+              AND order_type = 'offer'
+              AND status = 'active'
+              AND end_time > ${now}
+          `,
+        ]);
 
-    return jsonResponse({
-      collection,
-      chainId: Number(chainId),
-      listingCount: Number(listingStats[0]?.listing_count || 0),
-      floorPriceWei: listingStats[0]?.floor_price_wei?.toString() || null,
-      offerCount: Number(offerStats[0]?.offer_count || 0),
-      bestOfferWei: offerStats[0]?.best_offer_wei?.toString() || null,
-    });
-  } catch (err: any) {
-    console.error("[oob-api] Failed to fetch collection stats:", err);
-    return jsonError(500, "Failed to fetch collection stats");
+        return {
+          collection,
+          chainId: Number(chainId),
+          listingCount: Number(listingStats[0]?.listing_count || 0),
+          floorPriceWei: listingStats[0]?.floor_price_wei?.toString() || null,
+          offerCount: Number(offerStats[0]?.offer_count || 0),
+          bestOfferWei: offerStats[0]?.best_offer_wei?.toString() || null,
+        };
+      },
+      getCacheConfig("collectionStats")
+    );
+
+    return jsonResponse(cachedResult);
+  } catch (cacheErr) {
+    console.warn("[oob-api] Cache unavailable for collection stats, falling back to DB:", cacheErr);
+    
+    // Fallback to direct DB query
+    const sql = getPooledSqlClient(ctx.env);
+    const now = Math.floor(Date.now() / 1000);
+
+    try {
+      const [listingStats, offerStats] = await Promise.all([
+        sql`
+          SELECT
+            COUNT(*) as listing_count,
+            MIN(CAST(price_wei AS NUMERIC)) as floor_price_wei
+          FROM seaport_orders
+          WHERE chain_id = ${Number(chainId)}
+            AND nft_contract = ${collection}
+            AND order_type = 'listing'
+            AND status = 'active'
+            AND end_time > ${now}
+        `,
+        sql`
+          SELECT
+            COUNT(*) as offer_count,
+            MAX(CAST(price_wei AS NUMERIC)) as best_offer_wei
+          FROM seaport_orders
+          WHERE chain_id = ${Number(chainId)}
+            AND nft_contract = ${collection}
+            AND order_type = 'offer'
+            AND status = 'active'
+            AND end_time > ${now}
+        `,
+      ]);
+
+      return jsonResponse({
+        collection,
+        chainId: Number(chainId),
+        listingCount: Number(listingStats[0]?.listing_count || 0),
+        floorPriceWei: listingStats[0]?.floor_price_wei?.toString() || null,
+        offerCount: Number(offerStats[0]?.offer_count || 0),
+        bestOfferWei: offerStats[0]?.best_offer_wei?.toString() || null,
+      });
+    } catch (err: any) {
+      console.error("[oob-api] Failed to fetch collection stats:", err);
+      return jsonError(500, "Failed to fetch collection stats");
+    }
   }
 }
 
@@ -1052,9 +1430,13 @@ export async function handleGetActivity(ctx: RouteContext): Promise<Response> {
   const collection = params.get("collection")?.toLowerCase();
   const tokenId = params.get("tokenId");
   const eventType = params.get("eventType");
-  const address = params.get("address")?.toLowerCase(); // from or to
+  const addressRaw = params.get("address")?.toLowerCase();
+  if (addressRaw && !isValidAddress(addressRaw)) {
+    return jsonError(400, "Invalid address parameter");
+  }
+  const address = addressRaw; // from or to
   const limit = Math.min(Math.max(Number(params.get("limit") || 50), 1), 200);
-  const offset = Math.max(Number(params.get("offset") || 0), 0);
+  const offset = Math.min(Math.max(Number(params.get("offset") || 0), 0), 10000);
 
   const sql = getPooledSqlClient(ctx.env);
 
@@ -1200,7 +1582,7 @@ export async function handleBatchSubmitOrders(ctx: RouteContext): Promise<Respon
 async function processSingleOrderSubmit(
   sql: SqlClient,
   item: BatchOrderInput,
-  env: { PROTOCOL_FEE_RECIPIENT: string; PROTOCOL_FEE_BPS?: string },
+  env: Env,
 ): Promise<BatchSubmitResult> {
   const { chainId, order, signature } = item;
 
@@ -1235,34 +1617,8 @@ async function processSingleOrderSubmit(
 
   // Verify EIP-712 signature
   try {
-    // ethers is now a static top-level import
-    const domain = {
-      name: "Seaport", version: "1.6",
-      chainId: Number(chainId),
-      verifyingContract: "0x0000000000000068F116a894984e2DB1123eB395",
-    };
-    const types = {
-      OrderComponents: [
-        { name: "offerer", type: "address" }, { name: "zone", type: "address" },
-        { name: "offer", type: "OfferItem[]" }, { name: "consideration", type: "ConsiderationItem[]" },
-        { name: "orderType", type: "uint8" }, { name: "startTime", type: "uint256" },
-        { name: "endTime", type: "uint256" }, { name: "zoneHash", type: "bytes32" },
-        { name: "salt", type: "uint256" }, { name: "conduitKey", type: "bytes32" },
-        { name: "counter", type: "uint256" },
-      ],
-      OfferItem: [
-        { name: "itemType", type: "uint8" }, { name: "token", type: "address" },
-        { name: "identifierOrCriteria", type: "uint256" }, { name: "startAmount", type: "uint256" },
-        { name: "endAmount", type: "uint256" },
-      ],
-      ConsiderationItem: [
-        { name: "itemType", type: "uint8" }, { name: "token", type: "address" },
-        { name: "identifierOrCriteria", type: "uint256" }, { name: "startAmount", type: "uint256" },
-        { name: "endAmount", type: "uint256" }, { name: "recipient", type: "address" },
-      ],
-    };
-    const recovered = ethers.verifyTypedData(domain, types, order, signature);
-    if (recovered.toLowerCase() !== offerer) {
+    const recovered = await recoverSeaportOrderSigner(Number(chainId), order, signature as Hex);
+    if (recovered !== offerer) {
       return { orderHash: "", status: "error", error: "Signature does not match offerer" };
     }
   } catch {
@@ -1285,22 +1641,19 @@ async function processSingleOrderSubmit(
 
   const orderHash = computeOrderHash(order, Number(chainId));
 
-  // Check duplicate
-  const existing = await sql`SELECT order_hash FROM seaport_orders WHERE order_hash = ${orderHash}`;
-  if (existing.length > 0) {
+  // Redis-based deduplication (faster than DB); fall back to DB on Redis error
+  const dedupResult = await new RedisCache(env).deduplicate(orderHash, 300).catch(() => "error" as const);
+  if (dedupResult === "duplicate") {
     return { orderHash, status: "active", duplicate: true };
   }
-
-  // Per-offerer active order limit (prevent DB spam)
-  const activeCount = await sql`
-    SELECT COUNT(*)::int as cnt FROM seaport_orders
-    WHERE offerer = ${offerer} AND status = 'active'
-  `;
-  if (Number(activeCount[0]?.cnt || 0) >= MAX_ACTIVE_ORDERS_PER_OFFERER) {
-    return { orderHash, status: "error", error: `Too many active orders for this offerer (max ${MAX_ACTIVE_ORDERS_PER_OFFERER})` };
+  if (dedupResult === "error") {
+    const existing = await sql`SELECT order_hash FROM seaport_orders WHERE order_hash = ${orderHash}`;
+    if (existing.length > 0) {
+      return { orderHash, status: "active", duplicate: true };
+    }
   }
 
-  // Duplicate listing check
+  // Duplicate listing check (before the atomic insert below)
   if (orderType === "listing") {
     const dupListing = await sql`
       SELECT order_hash FROM seaport_orders
@@ -1316,7 +1669,9 @@ async function processSingleOrderSubmit(
 
   const zone = order.zone || "0x0000000000000000000000000000000000000000";
 
-  await sql`
+  // Atomically enforce the per-offerer cap: INSERT ... SELECT so the count check
+  // and the insert happen in a single statement — no race condition possible.
+  const insertResult = await sql`
     INSERT INTO seaport_orders (
       order_hash, chain_id, order_type, offerer, zone,
       nft_contract, token_id, token_standard,
@@ -1325,7 +1680,8 @@ async function processSingleOrderSubmit(
       royalty_recipient, royalty_bps,
       order_json, signature,
       start_time, end_time, status
-    ) VALUES (
+    )
+    SELECT
       ${orderHash}, ${Number(chainId)}, ${orderType}, ${offerer}, ${zone},
       ${nftContract}, ${tokenId}, ${tokenStandard},
       ${priceWei.toString()}, ${currency},
@@ -1333,8 +1689,15 @@ async function processSingleOrderSubmit(
       ${royaltyRecipient || null}, ${royaltyBps},
       ${JSON.stringify(order)}, ${signature},
       ${startTime}, ${endTime}, 'active'
-    )
+    WHERE (
+      SELECT COUNT(*)::int FROM seaport_orders
+      WHERE offerer = ${offerer} AND status = 'active'
+    ) < ${MAX_ACTIVE_ORDERS_PER_OFFERER}
+    RETURNING order_hash
   `;
+  if (!insertResult || insertResult.length === 0) {
+    return { orderHash, status: "error", error: `Too many active orders for this offerer (max ${MAX_ACTIVE_ORDERS_PER_OFFERER})` };
+  }
 
   await logActivity(sql, {
     orderHash,
@@ -1346,34 +1709,98 @@ async function processSingleOrderSubmit(
     currency,
   });
 
+  // Invalidate related cache entries (same as single-order path)
+  try {
+    const cache = new RedisCache(env);
+    const chainIdStr = String(chainId);
+    await Promise.all([
+      cache.del(CacheKeys.allBestListings(chainIdStr, nftContract)),
+      cache.del(CacheKeys.allCollectionStats(chainIdStr, nftContract)),
+      cache.del(CacheKeys.allOrdersLists(chainIdStr, nftContract)),
+    ]);
+  } catch {
+    // Non-fatal — cache will expire naturally
+  }
+
   return { orderHash, status: "active" };
+}
+
+// ─── On-chain ownerOf validation ────────────────────────────────────────────
+
+const CHAIN_RPC_MAP: Record<number, keyof Env> = {
+  1: "RPC_URL_ETHEREUM",
+  8453: "RPC_URL_BASE",
+  84532: "RPC_URL_BASE_SEPOLIA",
+  999: "RPC_URL_HYPERLIQUID",
+  2020: "RPC_URL_RONIN",
+  202601: "RPC_URL_RONIN_TESTNET",
+  2741: "RPC_URL_ABSTRACT",
+};
+
+const OWNER_OF_SELECTOR = "0x6352211e";
+
+function encodeUint256Hex(value: string): string {
+  return BigInt(value).toString(16).padStart(64, "0");
+}
+
+/**
+ * Check on-chain whether the offerer still owns the NFT.
+ * Returns null if the RPC is unavailable or the call fails (fail-open).
+ * Returns true if offerer owns the token, false if not.
+ */
+async function checkOwnerOf(
+  env: Env,
+  chainId: number,
+  nftContract: string,
+  tokenId: string,
+  offerer: string,
+): Promise<boolean | null> {
+  const rpcKey = CHAIN_RPC_MAP[chainId];
+  const rpcUrl = rpcKey ? (env[rpcKey] as string | undefined) : undefined;
+  if (!rpcUrl) return null; // No RPC configured for this chain — skip
+
+  try {
+    const callData = OWNER_OF_SELECTOR + encodeUint256Hex(tokenId);
+    const resp = await fetch(rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_call",
+        params: [{ to: nftContract, data: callData }, "latest"],
+      }),
+    });
+    const json = await resp.json() as any;
+    if (json.error || !json.result || json.result.length < 42) return null;
+    const owner = "0x" + json.result.slice(-40).toLowerCase();
+    return owner === offerer.toLowerCase();
+  } catch {
+    return null; // RPC failure — fail open
+  }
 }
 
 // ─── GET /v1/orders/:hash/fill-tx ───────────────────────────────────────────
 
 const SEAPORT_ADDRESS = "0x0000000000000068F116a894984e2DB1123eB395";
 
-const FULFILL_ORDER_SIG =
-  "fulfillOrder((((uint8,address,uint256,uint256,uint256)[],(uint8,address,uint256,uint256,uint256,address)[],uint8,uint256,uint256,bytes32,uint256,bytes32,uint256),bytes),bytes32)";
-
-const FULFILL_ADVANCED_ORDER_SIG =
-  "fulfillAdvancedOrder((((uint8,address,uint256,uint256,uint256)[],(uint8,address,uint256,uint256,uint256,address)[],uint8,uint256,uint256,bytes32,uint256,bytes32,uint256),uint120,uint120,bytes,bytes),(uint256,uint8,uint256,uint256,bytes32[])[],bytes32,address)";
-
 /**
  * Encode calldata for Seaport fulfillOrder (no tip).
- * Uses ethers AbiCoder — already a dependency, no new packages needed.
  */
 function encodeFulfillOrder(orderJson: any, signature: string): string {
-  const iface = new ethers.Interface([
-    `function ${FULFILL_ORDER_SIG} payable returns (bool)`,
-  ]);
-
   const params = buildOrderParameters(orderJson);
 
-  return iface.encodeFunctionData("fulfillOrder", [
-    { parameters: params, signature },
-    "0x0000000000000000000000000000000000000000000000000000000000000000", // fulfillerConduitKey
-  ]);
+  return encodeFunctionData({
+    abi: SEAPORT_FULFILL_ORDER_ABI,
+    functionName: "fulfillOrder",
+    args: [
+      {
+        parameters: params,
+        signature: signature as Hex,
+      },
+      "0x0000000000000000000000000000000000000000000000000000000000000000" as Hex,
+    ],
+  });
 }
 
 /**
@@ -1387,40 +1814,40 @@ function encodeFulfillAdvancedOrder(
   tipAmount: bigint,
   tipRecipient: string,
 ): string {
-  const iface = new ethers.Interface([
-    `function ${FULFILL_ADVANCED_ORDER_SIG} payable returns (bool)`,
-  ]);
-
   const params = buildOrderParameters(orderJson);
 
   const considerationWithTip = [
     ...params.consideration,
     {
       itemType: tipItemType,
-      token: tipToken,
+      token: tipToken as Address,
       identifierOrCriteria: 0n,
       startAmount: tipAmount,
       endAmount: tipAmount,
-      recipient: tipRecipient,
+      recipient: tipRecipient as Address,
     },
   ];
 
-  return iface.encodeFunctionData("fulfillAdvancedOrder", [
-    {
-      parameters: { ...params, consideration: considerationWithTip },
-      numerator: 1n,
-      denominator: 1n,
-      signature,
-      extraData: "0x",
-    },
-    [], // criteriaResolvers
-    "0x0000000000000000000000000000000000000000000000000000000000000000", // fulfillerConduitKey
-    "0x0000000000000000000000000000000000000000", // recipient (0 = msg.sender)
-  ]);
+  return encodeFunctionData({
+    abi: SEAPORT_FULFILL_ADVANCED_ORDER_ABI,
+    functionName: "fulfillAdvancedOrder",
+    args: [
+      {
+        parameters: { ...params, consideration: considerationWithTip },
+        numerator: 1n,
+        denominator: 1n,
+        signature: signature as Hex,
+        extraData: "0x" as Hex,
+      },
+      [], // criteriaResolvers
+      "0x0000000000000000000000000000000000000000000000000000000000000000" as Hex, // fulfillerConduitKey
+      "0x0000000000000000000000000000000000000000" as Address, // recipient (0 = msg.sender)
+    ],
+  });
 }
 
 /**
- * Convert stored orderJson (string amounts) into the struct ethers expects (bigints).
+ * Convert stored orderJson (string amounts) into the struct viem expects (bigints).
  */
 function buildOrderParameters(orderJson: any) {
   return {
@@ -1485,6 +1912,9 @@ export async function handleFillTx(ctx: RouteContext): Promise<Response> {
   const buyer = ctx.params.get("buyer")?.toLowerCase();
   if (!buyer) return jsonError(400, "Missing required query param: buyer");
   if (!isValidAddress(buyer)) return jsonError(400, "Invalid buyer address");
+
+  // Optional on-chain ownership validation before returning calldata
+  const validateOnChain = ctx.params.get("validate") === "true";
 
   // Optional tip
   const tipRecipientRaw = ctx.params.get("tipRecipient");
@@ -1555,9 +1985,49 @@ export async function handleFillTx(ctx: RouteContext): Promise<Response> {
     });
   }
 
-  const orderJson = typeof row.order_json === "string"
-    ? JSON.parse(row.order_json)
-    : row.order_json;
+  // Optimistic locking: warn if another agent is already filling this order
+  let fillPendingWarning: string | undefined;
+  try {
+    const cache = new RedisCache(ctx.env);
+    const alreadyPending = await cache.isPending(orderHash);
+    if (alreadyPending) {
+      fillPendingWarning = "Another buyer is currently processing this order. High risk of transaction failure.";
+    } else {
+      await cache.setPending(orderHash, 30); // 30s TTL — enough for a tx to land
+    }
+  } catch {
+    // Redis unavailable — fail open, proceed without locking
+  }
+
+  // Optional on-chain ownerOf check — only for ERC721 listings, only when ?validate=true
+  if (validateOnChain && row.token_standard === "ERC721") {
+    const ownerOf = await checkOwnerOf(
+      ctx.env,
+      Number(row.chain_id),
+      row.nft_contract,
+      row.token_id,
+      row.offerer,
+    );
+    if (ownerOf === false) {
+      return jsonError(409, {
+        code: "SELLER_NO_LONGER_OWNS",
+        message: "The seller no longer owns this NFT. This order will revert if filled.",
+        orderHash: row.order_hash,
+        offerer: row.offerer,
+        nftContract: row.nft_contract,
+        tokenId: row.token_id,
+      });
+    }
+    // ownerOf === null means RPC unavailable — fail open, proceed with calldata
+  }
+
+  let orderJson: any;
+  try {
+    orderJson = typeof row.order_json === "string" ? JSON.parse(row.order_json) : row.order_json;
+  } catch {
+    console.error("[oob-api] fill-tx: malformed order_json for", row.order_hash);
+    return jsonError(500, { code: "MALFORMED_ORDER", message: "Stored order data is malformed.", orderHash: row.order_hash });
+  }
   const signature = row.signature as string;
 
   // Calculate ETH value the buyer must send (sum of all NATIVE consideration items)
@@ -1601,7 +2071,6 @@ export async function handleFillTx(ctx: RouteContext): Promise<Response> {
       code: "CALLDATA_ENCODING_FAILED",
       message: "Failed to encode Seaport transaction calldata. The stored order data may be malformed.",
       orderHash: row.order_hash,
-      detail: err?.message ?? "Unknown encoding error",
     });
   }
 
@@ -1625,6 +2094,7 @@ export async function handleFillTx(ctx: RouteContext): Promise<Response> {
     priceDecimal: formatPriceDecimal(row.price_wei, cm.currencyDecimals),
     expiresAt: Number(row.end_time),
     ...(hasTip ? { tipBps, tipRecipient: tipRecipientRaw } : {}),
+    ...(fillPendingWarning ? { warning: fillPendingWarning } : {}),
   });
 }
 
@@ -1675,7 +2145,7 @@ export async function handleBatchFillTx(ctx: RouteContext): Promise<Response> {
   }
   for (const h of orderHashes) {
     if (typeof h !== "string" || !ORDER_HASH_RE.test(h)) {
-      return jsonError(400, `Invalid order hash in array: ${h}`);
+      return jsonError(400, "Invalid order hash in array: each hash must be a 0x-prefixed 32-byte hex string");
     }
   }
 
@@ -1784,9 +2254,14 @@ export async function handleBatchFillTx(ctx: RouteContext): Promise<Response> {
       continue;
     }
 
-    const orderJson = typeof row.order_json === "string"
-      ? JSON.parse(row.order_json)
-      : row.order_json;
+    let orderJson: any;
+    try {
+      orderJson = typeof row.order_json === "string" ? JSON.parse(row.order_json) : row.order_json;
+    } catch {
+      console.error("[oob-api] batch fill-tx: malformed order_json for", orderHash);
+      transactions.push({ orderHash, error: { code: "MALFORMED_ORDER", message: "Stored order data is malformed." } });
+      continue;
+    }
     const signature = row.signature as string;
 
     const isNativePayment = row.currency === "0x0000000000000000000000000000000000000000";
@@ -1834,7 +2309,6 @@ export async function handleBatchFillTx(ctx: RouteContext): Promise<Response> {
         error: {
           code: "CALLDATA_ENCODING_FAILED",
           message: "Failed to encode Seaport transaction calldata. The stored order data may be malformed.",
-          detail: err?.message ?? "Unknown encoding error",
         },
       });
       continue;
@@ -1970,9 +2444,13 @@ export async function handleBestListingFillTx(ctx: RouteContext): Promise<Respon
   }
 
   const row = rows[0];
-  const orderJson = typeof row.order_json === "string"
-    ? JSON.parse(row.order_json)
-    : row.order_json;
+  let orderJson: any;
+  try {
+    orderJson = typeof row.order_json === "string" ? JSON.parse(row.order_json) : row.order_json;
+  } catch {
+    console.error("[oob-api] best-listing/fill-tx: malformed order_json for", row.order_hash);
+    return jsonError(500, { code: "MALFORMED_ORDER", message: "Stored order data is malformed.", orderHash: row.order_hash });
+  }
   const signature = row.signature as string;
 
   const isNativePayment = row.currency === "0x0000000000000000000000000000000000000000";
@@ -2001,7 +2479,6 @@ export async function handleBestListingFillTx(ctx: RouteContext): Promise<Respon
       code: "CALLDATA_ENCODING_FAILED",
       message: "Failed to encode Seaport transaction calldata. The stored order data may be malformed.",
       orderHash: row.order_hash,
-      detail: err?.message ?? "Unknown encoding error",
     });
   }
 
@@ -2044,7 +2521,6 @@ export async function handleBestListingFillTx(ctx: RouteContext): Promise<Respon
 // Response:
 //   { to, data, value, spender, amount, token }
 
-const ERC20_APPROVE_SIG = "approve(address,uint256)";
 const MAX_UINT256 = (2n ** 256n - 1n).toString();
 
 export async function handleErc20ApproveTx(ctx: RouteContext): Promise<Response> {
@@ -2067,14 +2543,16 @@ export async function handleErc20ApproveTx(ctx: RouteContext): Promise<Response>
 
   let calldata: string;
   try {
-    const iface = new ethers.Interface([`function ${ERC20_APPROVE_SIG}`]);
-    calldata = iface.encodeFunctionData("approve", [spender, amount]);
+    calldata = encodeFunctionData({
+      abi: ERC20_APPROVE_ABI,
+      functionName: "approve",
+      args: [spender as Address, amount],
+    });
   } catch (err: any) {
     console.error("[oob-api] erc20/approve-tx: encoding error:", err);
     return jsonError(500, {
       code: "CALLDATA_ENCODING_FAILED",
       message: "Failed to encode ERC20 approve calldata.",
-      detail: err?.message ?? "Unknown encoding error",
     });
   }
 
@@ -2171,10 +2649,9 @@ async function processSingleOrderCancel(
   }
 
   try {
-    // ethers is now a static top-level import
     const message = `cancel:${orderHash}`;
-    const recovered = ethers.verifyMessage(message, cancelSig);
-    if (recovered.toLowerCase() !== orderRows[0].offerer.toLowerCase()) {
+    const recovered = await recoverCancelSigner(message, cancelSig as Hex);
+    if (recovered !== orderRows[0].offerer.toLowerCase()) {
       return { orderHash, status: "error", error: "Cancel signature does not match offerer" };
     }
   } catch {

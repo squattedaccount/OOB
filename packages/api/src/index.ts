@@ -22,9 +22,9 @@
  *   GET    /health                       — Health check
  */
 
-import type { Env, RouteContext } from "./types.js";
+import type { Env, RouteContext, OrderIngestMessage } from "./types.js";
 import { jsonResponse, jsonError, corsPreflightResponse } from "./response.js";
-import { checkRateLimit, addRateLimitHeaders } from "./rateLimit.js";
+import { checkRateLimitRedis, addRateLimitHeadersRedis } from "./rateLimitRedis.js";
 import { logRequestAudit } from "./audit.js";
 import {
   handleGetOrders,
@@ -42,10 +42,15 @@ import {
   handleBestListingFillTx,
   handleErc20ApproveTx,
 } from "./routes/orders.js";
+import { handleOrderIngestQueue } from "./queue.js";
 
 export { OrderStreamDO } from "./stream.js";
 
 export default {
+  async queue(batch: MessageBatch<OrderIngestMessage>, env: Env): Promise<void> {
+    return handleOrderIngestQueue(batch, env);
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     // Handle CORS preflight
     if (request.method === "OPTIONS") {
@@ -66,18 +71,18 @@ export default {
 
     // Audit log write operations
     if (isWrite) {
-      logRequestAudit(request, env, url.pathname);
+      await logRequestAudit(request, env, url.pathname);
     }
 
     // Rate limiting
-    const rateLimitResponse = await checkRateLimit(request, env, isWrite);
+    const rateLimitResponse = await checkRateLimitRedis(request, env, isWrite);
     if (rateLimitResponse) return rateLimitResponse;
 
     const ctx: RouteContext = { request, env, url, segments, params };
 
     try {
       const response = await route(ctx, segments, request.method);
-      return addRateLimitHeaders(response, request, env, isWrite);
+      return addRateLimitHeadersRedis(response, request, env, isWrite);
     } catch (err: any) {
       console.error("[oob-api] Unhandled error:", err);
       return jsonError(500, "Internal server error");
@@ -92,7 +97,7 @@ async function handleStreamUpgrade(
 ): Promise<Response> {
   // Apply rate limiting to websocket upgrades as well.
   // Treat as write-tier to keep connection floods tightly constrained.
-  const rateLimitResponse = await checkRateLimit(request, env, true);
+  const rateLimitResponse = await checkRateLimitRedis(request, env, true);
   if (rateLimitResponse) return rateLimitResponse;
 
   if (!env.ORDER_STREAM) {

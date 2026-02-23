@@ -18,6 +18,10 @@ export interface Env {
   RPC_URL_ABSTRACT?: string;
   RPC_URL_BASE_SEPOLIA?: string;
   RPC_URL_RONIN_TESTNET?: string;
+
+  // Upstash Redis for coordination locks
+  UPSTASH_REDIS_REST_URL?: string;
+  UPSTASH_REDIS_REST_TOKEN?: string;
 }
 
 export interface SeaportLifecycleEvent {
