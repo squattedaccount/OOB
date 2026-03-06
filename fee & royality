@@ -1,0 +1,316 @@
+OOB Fee & Royalty System — Design Specification
+Overview
+This document defines the fee and royalty architecture for the Open Order Book (OOB) protocol.
+
+Fee model: A fixed ~1% total fee, split equally three ways between the protocol, the listing marketplace, and the buying marketplace.
+
+Royalty model: Optional by default. If a listing marketplace chooses to enforce royalties, they are baked into the signed order and enforced by Seaport automatically. No zone or registry logic needed for royalties.
+
+1. Fee Structure
+Split
+Recipient	BPS	Percentage	How
+OOB Protocol	33	0.33%	Baked into order at listing time
+Listing Marketplace	33	0.33%	Baked into order at listing time
+Buying Marketplace	33	0.33%	Added as tip at fill time, enforced by Zone
+Total	99	~1%	
+NOTE
+
+0.33% × 3 = 0.99%, not exactly 1%. This is because basis points are integers. Options:
+
+Use 33 + 33 + 33 = 99 bps (0.99%) — clean and equal
+Use 34 + 33 + 33 = 100 bps (1.00%) — protocol takes the extra bp
+Make this configurable in the protocol config
+Recommendation: 33 + 33 + 33 = 99 bps. Simple, equal, transparent.
+
+Example: 1 ETH Listing
+At listing time (baked into signed order):
+
+#	Consideration item	Recipient	Amount
+0	Seller proceeds	Seller	0.9934 ETH
+1	Protocol fee	OOB Treasury	0.0033 ETH
+2	Listing MP fee	Marketplace 1	0.0033 ETH
+Total order price		1.0 ETH
+At fill time (added by buying marketplace):
+
+#	Extra consideration	Recipient	Amount
+3	Buying MP tip	Marketplace 2	0.0033 ETH
+Buyer pays total		1.0033 ETH
+Same-marketplace scenario
+When the listing and buying marketplace are the same entity:
+
+Recipient	Amount	Note
+Seller	0.9934 ETH	
+OOB Protocol	0.0033 ETH	0.33%
+Marketplace	0.0033 + 0.0033 = 0.0066 ETH	0.66% total (both shares)
+Buyer pays	1.0033 ETH	Same as cross-marketplace
+The marketplace tip goes to their own fee address, so they naturally collect both the listing and buying shares. No special logic needed.
+
+Key property: Buyer pays the same everywhere
+No matter which marketplace the buyer uses, they always pay listing price + 0.33%. There is no incentive to shop across marketplaces for lower fees.
+
+2. Enforcement Mechanism
+What's baked into the order (enforced by Seaport)
+The protocol fee (0.33%) and listing marketplace fee (0.33%) are consideration items in the signed Seaport order. They are:
+
+Signed by the seller via EIP-712 — tamper-proof
+Enforced by Seaport at settlement — the transaction reverts if any consideration item isn't satisfied
+Validated by the OOB API at submission time — orders without the protocol fee are rejected
+These are already 100% secure. No zone needed.
+
+What's added at fill time (enforced by Zone)
+The buying marketplace fee (0.33%) is added as an extra consideration item via fulfillAdvancedOrder. This is the "tip" mechanism in Seaport.
+
+Without a zone: tips are optional. A buyer could call Seaport directly and skip the tip.
+
+With a zone: the tip becomes mandatory. The zone validates that the tip is present and sufficient.
+
+Zone Contract
+Why Zone is the best option
+Option	100% bypass-proof?	Decentralized?	Complexity
+Zone contract	✅ Yes	✅ Yes	Low (~60 lines)
+Tips without zone	❌ No (anyone can skip)	✅	None
+Signed zone (co-signature)	✅ Yes	❌ No (needs OOB API)	Medium
+Contract orders	✅ Yes	✅ Yes	Very high
+The Zone contract is the only option that is both 100% bypass-proof AND fully decentralized (no dependency on OOB API for fills).
+
+How it works
+All OOB orders use orderType: FULL_RESTRICTED (instead of FULL_OPEN)
+The order's zone field points to the OOB Zone contract
+The zoneHash encodes: originalConsiderationCount + minTipBps (33)
+When anyone fills the order, Seaport calls zone.validateOrder()
+The zone checks that extra consideration items total at least 0.33% of the order price
+If the check fails, the entire transaction reverts
+Zone contract (pseudocode)
+solidity
+contract OOBZone is IERC165 {
+    function validateOrder(ZoneParameters calldata zoneParams)
+        external view returns (bytes4)
+    {
+        // Decode parameters from zoneHash
+        uint256 encoded = uint256(zoneParams.zoneHash);
+        uint256 originalCount = (encoded >> 16) & 0xFF;
+        uint256 minTipBps = encoded & 0xFFFF;  // 33 = 0.33%
+        
+        // Must have extra consideration items (the buying MP tip)
+        require(
+            zoneParams.consideration.length > originalCount,
+            "Missing marketplace tip"
+        );
+        
+        // Calculate total price from original consideration items
+        uint256 originalPrice = 0;
+        for (uint i = 0; i < originalCount; i++) {
+            ItemType itemType = zoneParams.consideration[i].itemType;
+            if (itemType == ItemType.NATIVE || itemType == ItemType.ERC20) {
+                originalPrice += zoneParams.consideration[i].amount;
+            }
+        }
+        
+        // Calculate total tips (everything beyond original items)
+        uint256 tipTotal = 0;
+        for (uint i = originalCount; i < zoneParams.consideration.length; i++) {
+            ItemType itemType = zoneParams.consideration[i].itemType;
+            if (itemType == ItemType.NATIVE || itemType == ItemType.ERC20) {
+                tipTotal += zoneParams.consideration[i].amount;
+            }
+        }
+        
+        // Enforce minimum tip
+        uint256 minTip = (originalPrice * minTipBps) / 10000;
+        require(tipTotal >= minTip, "Tip below minimum");
+        
+        return this.validateOrder.selector;
+    }
+    
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return interfaceId == type(IERC165).interfaceId
+            || interfaceId == 0x3839be19; // ZoneInterface
+    }
+}
+What Seaport functions are covered?
+Seaport function	Zone validated?	Can bypass?
+fulfillOrder()	✅	❌ (can't add tips → zone rejects for missing tip)
+fulfillAdvancedOrder()	✅	❌ (zone validates tip amount)
+matchOrders()	✅	❌
+matchAdvancedOrders()	✅	❌
+fulfillAvailableOrders()	✅	❌
+fulfillAvailableAdvancedOrders()	✅	❌
+There is no Seaport function that bypasses zone validation for restricted orders.
+
+3. Royalty System
+Design principle
+Royalties are optional by default. The listing marketplace decides. If they include royalties, Seaport enforces them automatically. No zone logic, no registry, no extra mechanisms needed.
+
+How it works
+Marketplace enforces royalties
+typescript
+const oob = new OpenOrderBook({
+  chainId: 8453,
+  enforceRoyalties: true,  // ← marketplace opts in
+});
+When 
+createListing()
+ is called, the SDK:
+
+Calls supportsInterface(0x2a55205a) on the NFT contract (EIP-2981 check)
+If supported: calls royaltyInfo(tokenId, priceWei) to get receiver + amount
+Adds the royalty as a consideration item in the order
+Seller signs → royalty is permanent, enforced by Seaport
+Consideration items (royalty-enforcing marketplace):
+  [0] Seller proceeds    → seller       (price - protocol - MP - royalty)
+  [1] Protocol fee       → OOB          (0.33%)
+  [2] Listing MP fee     → marketplace  (0.33%)
+  [3] Creator royalty    → creator      (e.g., 5%)
+Marketplace doesn't enforce royalties
+typescript
+const oob = new OpenOrderBook({
+  chainId: 8453,
+  // enforceRoyalties defaults to false
+});
+SDK does NOT auto-query EIP-2981. Marketplace can still manually provide royaltyBps and royaltyRecipient in 
+CreateListingParams
+ if they want, but it's optional.
+
+Why this is already bypass-proof
+Royalties are consideration items in the signed Seaport order. If they're included:
+
+The seller signed them — can't be removed without invalidating the signature
+Seaport enforces them — the fill transaction reverts if royalties aren't paid
+No zone logic is needed — Seaport handles it natively
+If they're NOT included (marketplace chose not to enforce):
+
+No enforcement, no problem — that's the marketplace's choice
+Buyers on any marketplace fill royalty-free — the system doesn't care
+Example with royalties
+1 ETH listing, 5% creator royalty, listing marketplace enforces:
+
+Recipient	Amount	Source
+Seller	0.9434 ETH	Price - all fees - royalty
+OOB Protocol	0.0033 ETH	0.33% (baked in)
+Listing MP	0.0033 ETH	0.33% (baked in)
+Creator	0.05 ETH	5% royalty (baked in)
+Buying MP	0.0033 ETH	0.33% (tip at fill)
+Buyer pays	1.0033 ETH	
+What the zoneHash encodes
+When royalties are present, the originalConsiderationCount increases from 3 to 4:
+
+zoneHash field	Without royalty	With royalty
+originalConsiderationCount	3	4
+minTipBps	33	33
+The zone uses originalConsiderationCount to determine where original items end and extra items (tips) begin. This correctly handles both cases without any royalty-specific logic in the zone.
+
+4. SDK Configuration
+Marketplace config
+typescript
+const oob = new OpenOrderBook({
+  // Required
+  chainId: 8453,
+  
+  // Marketplace identity (fee collection)
+  feeRecipient: '0xMarketplaceFeeAddress',
+  
+  // Royalty policy
+  enforceRoyalties: true,  // default: false
+  
+  // Optional
+  apiUrl: 'https://api.openorderbook.xyz',
+  apiKey: 'mp1-key-xxx',
+});
+Creating a listing
+typescript
+const listing = await oob.createListing({
+  collection: '0xNFT',
+  tokenId: '42',
+  priceWei: '1000000000000000000', // 1 ETH
+  // royaltyBps and royaltyRecipient are auto-populated
+  // from EIP-2981 if enforceRoyalties is true
+});
+Filling an order
+typescript
+// SDK always adds the 0.33% tip to the marketplace's feeRecipient
+const txHash = await oob.fillOrder(orderHash);
+// Buyer pays: listing price + 0.33% buying MP tip
+Protocol config (from API)
+json
+{
+  "protocolFeeBps": 33,
+  "protocolFeeRecipient": "0xOOB_TREASURY",
+  "minTipBps": 33,
+  "zoneAddress": "0xOOB_ZONE"
+}
+The SDK fetches this from GET /v1/config and uses it to:
+
+Add the protocol fee as a consideration item (33 bps to OOB treasury)
+Set orderType: FULL_RESTRICTED and zone: zoneAddress
+Encode minTipBps into zoneHash
+5. Changes Required
+Smart contracts (deploy once per chain)
+Contract	Lines	Purpose
+OOB Zone	~60	Validates buying MP tip ≥ 0.33% on every fill
+SDK changes
+File	Change
+types.ts
+Add enforceRoyalties to 
+OobConfig
+. Update protocolFeeBps default to 33. Add zoneAddress to 
+ProtocolConfig
+.
+seaport.ts
+Set orderType: FULL_RESTRICTED, zone, and encoded zoneHash on all orders. Add EIP-2981 auto-query in 
+createListing
+ / 
+createOffer
+. Always add buying MP tip in 
+fillOrder
+.
+client.ts
+Pass enforceRoyalties flag through. Fetch zone address from protocol config.
+API changes
+File	Change
+types.ts
+Update PROTOCOL_FEE_BPS to 33. Add ZONE_ADDRESS and MIN_TIP_BPS env vars.
+index.ts
+Return zoneAddress and minTipBps from /v1/config.
+routes/orders.ts
+Update 
+validateFeeEnforcement
+ to check for 33 bps. Validate zone field matches expected zone address.
+6. Security Properties
+Property	Guaranteed by
+Protocol fee (0.33%) always collected	Seaport (consideration item) + API validation
+Listing MP fee (0.33%) always collected	Seaport (consideration item)
+Buying MP fee (0.33%) always collected	Zone contract (validates tip)
+Royalties paid when listing MP enforces	Seaport (consideration item)
+Royalties optional when listing MP doesn't enforce	By design — no enforcement mechanism
+Fees can't be modified after signing	EIP-712 signature (Seaport)
+Buyer pays same amount everywhere	Fixed tip amount (0.33%) enforced by zone
+Works if OOB API is down	Yes — zone is on-chain, Seaport is on-chain
+Works with direct Seaport calls	Yes — zone validates all fulfillment paths
+7. Summary
+┌─────────────────────────────────────────────────────────────────┐
+│  LISTING TIME (SDK creates Seaport order)                       │
+│                                                                 │
+│  Consideration items:                                           │
+│    [0] Seller proceeds     → seller          (price - fees)     │
+│    [1] Protocol fee        → OOB treasury    (0.33%)            │
+│    [2] Listing MP fee      → listing MP      (0.33%)            │
+│    [3] Creator royalty     → creator         (if enforced)      │
+│                                                                 │
+│  Order metadata:                                                │
+│    orderType: FULL_RESTRICTED                                   │
+│    zone: OOB Zone contract                                      │
+│    zoneHash: encode(originalCount=3or4, minTipBps=33)           │
+│                                                                 │
+│  Signed by seller → immutable                                   │
+├─────────────────────────────────────────────────────────────────┤
+│  FILL TIME (buyer fills via any marketplace)                    │
+│                                                                 │
+│  Extra consideration (tip):                                     │
+│    [3/4] Buying MP fee     → buying MP       (0.33%)            │
+│                                                                 │
+│  Zone validates:                                                │
+│    ✅ tip amount >= 0.33% of order price                        │
+│    If validation fails → transaction reverts                    │
+│                                                                 │
+│  Buyer pays: listing price + 0.33%                              │
+└─────────────────────────────────────────────────────────────────┘
