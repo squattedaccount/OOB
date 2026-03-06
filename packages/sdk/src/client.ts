@@ -9,6 +9,7 @@ import type {
   PublicClient,
   WalletClient,
 } from "viem";
+import { getAddress } from "viem";
 import { ApiClient } from "./api.js";
 import { SeaportClient } from "./seaport.js";
 import type {
@@ -26,8 +27,17 @@ import type {
   SubscribeParams,
   OobEvent,
   SeaportOrderComponents,
+  SubmitOrderParams,
+  OrderSubmissionMetadata,
+  RoyaltyPolicyMode,
 } from "./types.js";
-import { DEFAULT_API_URL, DEFAULT_FEE_BPS, DEFAULT_FEE_RECIPIENT } from "./types.js";
+import {
+  DEFAULT_API_URL,
+  DEFAULT_ORIGIN_FEE_BPS,
+  DEFAULT_ORIGIN_FEE_RECIPIENT,
+  DEFAULT_ROYALTY_POLICY,
+  MAX_ORIGIN_FEE_BPS,
+} from "./types.js";
 
 // ─── Input Validation ─────────────────────────────────────────────────────
 
@@ -51,10 +61,38 @@ function validatePositiveBigInt(value: string | bigint, label: string): void {
 
 function validateBps(value: number | undefined, label: string): void {
   if (value === undefined || value === 0) return;
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > MAX_ORIGIN_FEE_BPS) {
+    throw new Error(`Invalid ${label}: must be an integer between 0 and ${MAX_ORIGIN_FEE_BPS} (got ${value})`);
+  }
+}
+
+function validateRoyaltyBps(value: number | undefined, label: string): void {
+  if (value === undefined || value === 0) return;
   if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > 10000) {
     throw new Error(`Invalid ${label}: must be an integer between 0 and 10000 (got ${value})`);
   }
 }
+
+interface ResolvedRoyalty {
+  royaltyBps?: number;
+  royaltyRecipient?: string;
+}
+
+const ERC2981_ABI = [
+  {
+    type: "function",
+    name: "royaltyInfo",
+    stateMutability: "view",
+    inputs: [
+      { name: "tokenId", type: "uint256" },
+      { name: "salePrice", type: "uint256" },
+    ],
+    outputs: [
+      { name: "receiver", type: "address" },
+      { name: "royaltyAmount", type: "uint256" },
+    ],
+  },
+] as const;
 
 export class OpenOrderBook {
   readonly config: Required<OobConfig>;
@@ -65,16 +103,17 @@ export class OpenOrderBook {
   private publicClient?: PublicClient;
 
   constructor(config: OobConfig) {
-    validateBps(config.feeBps, "feeBps");
-    if ((config.feeBps ?? DEFAULT_FEE_BPS) > 0 && !(config.feeRecipient ?? DEFAULT_FEE_RECIPIENT)) {
-      throw new Error("Invalid config: feeRecipient is required when feeBps > 0");
+    validateBps(config.originFeeBps, "originFeeBps");
+    if ((config.originFeeBps ?? DEFAULT_ORIGIN_FEE_BPS) > 0 && !(config.originFeeRecipient ?? DEFAULT_ORIGIN_FEE_RECIPIENT)) {
+      throw new Error("Invalid config: originFeeRecipient is required when originFeeBps > 0");
     }
     this.config = {
       chainId: config.chainId,
       apiUrl: config.apiUrl ?? DEFAULT_API_URL,
       apiKey: config.apiKey ?? "",
-      feeBps: config.feeBps ?? DEFAULT_FEE_BPS,
-      feeRecipient: config.feeRecipient ?? DEFAULT_FEE_RECIPIENT,
+      originFeeBps: config.originFeeBps ?? DEFAULT_ORIGIN_FEE_BPS,
+      originFeeRecipient: config.originFeeRecipient ?? DEFAULT_ORIGIN_FEE_RECIPIENT,
+      royaltyPolicy: config.royaltyPolicy ?? DEFAULT_ROYALTY_POLICY,
     };
 
     this.api = new ApiClient(this.config);
@@ -109,6 +148,102 @@ export class OpenOrderBook {
       );
     }
     return this.publicClient;
+  }
+
+  private buildSubmissionMetadata(params: {
+    royaltyBps?: number;
+    royaltyRecipient?: string;
+  }): OrderSubmissionMetadata | undefined {
+    const metadata: OrderSubmissionMetadata = {};
+
+    if ((this.config.originFeeBps ?? 0) > 0 && this.config.originFeeRecipient) {
+      metadata.originFeeBps = this.config.originFeeBps;
+      metadata.originFeeRecipient = this.config.originFeeRecipient;
+    }
+
+    if ((params.royaltyBps ?? 0) > 0 && params.royaltyRecipient) {
+      metadata.royaltyBps = params.royaltyBps;
+      metadata.royaltyRecipient = params.royaltyRecipient;
+    }
+
+    return Object.keys(metadata).length > 0 ? metadata : undefined;
+  }
+
+  private normalizeExplicitRoyalty(params: {
+    royaltyBps?: number;
+    royaltyRecipient?: string;
+  }): ResolvedRoyalty {
+    if (params.royaltyRecipient) validateAddress(params.royaltyRecipient, "royaltyRecipient");
+    validateRoyaltyBps(params.royaltyBps, "royaltyBps");
+
+    const hasRecipient = !!params.royaltyRecipient;
+    const hasBps = (params.royaltyBps ?? 0) > 0;
+    if (hasRecipient !== hasBps) {
+      throw new Error("royaltyRecipient and royaltyBps must be provided together");
+    }
+
+    if (!hasRecipient || !hasBps) return {};
+    return {
+      royaltyBps: params.royaltyBps,
+      royaltyRecipient: params.royaltyRecipient,
+    };
+  }
+
+  private async resolveAutoRoyalty(
+    publicClient: PublicClient,
+    params: { collection: string; tokenId?: string; priceWei: string | bigint },
+  ): Promise<ResolvedRoyalty> {
+    if (!params.tokenId) return {};
+
+    try {
+      const salePrice = BigInt(params.priceWei);
+      const [receiver, royaltyAmount] = await publicClient.readContract({
+        address: getAddress(params.collection as Address),
+        abi: ERC2981_ABI,
+        functionName: "royaltyInfo",
+        args: [BigInt(params.tokenId), salePrice],
+      }) as readonly [Address, bigint];
+
+      if (!receiver || receiver === "0x0000000000000000000000000000000000000000" || royaltyAmount <= 0n) {
+        return {};
+      }
+
+      const royaltyBps = Number((royaltyAmount * 10000n) / salePrice);
+      if (!Number.isFinite(royaltyBps) || royaltyBps <= 0) {
+        return {};
+      }
+
+      return {
+        royaltyRecipient: receiver,
+        royaltyBps,
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  private async resolveRoyaltyParams(
+    publicClient: PublicClient,
+    params: { collection: string; tokenId?: string; priceWei: string | bigint; royaltyBps?: number; royaltyRecipient?: string },
+  ): Promise<ResolvedRoyalty> {
+    const explicit = this.normalizeExplicitRoyalty(params);
+
+    if (this.config.royaltyPolicy === "off") {
+      return {
+        royaltyBps: undefined,
+        royaltyRecipient: undefined,
+      };
+    }
+
+    if (explicit.royaltyBps && explicit.royaltyRecipient) {
+      return explicit;
+    }
+
+    if (this.config.royaltyPolicy === "manual_only") {
+      return {};
+    }
+
+    return this.resolveAutoRoyalty(publicClient, params);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -220,10 +355,19 @@ export class OpenOrderBook {
     validateAddress(params.collection, "collection");
     validatePositiveBigInt(params.priceWei, "priceWei");
     if (params.currency) validateAddress(params.currency, "currency");
-    if (params.royaltyRecipient) validateAddress(params.royaltyRecipient, "royaltyRecipient");
-    validateBps(params.royaltyBps, "royaltyBps");
 
     const { wallet, public: pub } = this.requireWallet();
+    const resolvedRoyalty = await this.resolveRoyaltyParams(pub, {
+      collection: params.collection,
+      tokenId: params.tokenId,
+      priceWei: params.priceWei,
+      royaltyBps: params.royaltyBps,
+      royaltyRecipient: params.royaltyRecipient,
+    });
+    const listingParams = {
+      ...params,
+      ...resolvedRoyalty,
+    };
 
     // Check approval first
     const isApproved = await this.seaport.isApprovedForAll(
@@ -243,8 +387,10 @@ export class OpenOrderBook {
     // Fetch current protocol fee from API (cached 5 min)
     const protocolConfig = await this.api.getProtocolConfig();
 
-    const { order, signature } = await this.seaport.createListing(params, wallet, pub, protocolConfig);
-    return this.api.submitOrder(order, signature);
+    const { order, signature } = await this.seaport.createListing(listingParams, wallet, pub, protocolConfig);
+    return this.api.submitOrder(order, signature, {
+      metadata: this.buildSubmissionMetadata(listingParams),
+    });
   }
 
   /**
@@ -263,10 +409,19 @@ export class OpenOrderBook {
     validateAddress(params.collection, "collection");
     validateAddress(params.currency, "currency");
     validatePositiveBigInt(params.amountWei, "amountWei");
-    if (params.royaltyRecipient) validateAddress(params.royaltyRecipient, "royaltyRecipient");
-    validateBps(params.royaltyBps, "royaltyBps");
 
     const { wallet, public: pub } = this.requireWallet();
+    const resolvedRoyalty = await this.resolveRoyaltyParams(pub, {
+      collection: params.collection,
+      tokenId: params.tokenId,
+      priceWei: params.amountWei,
+      royaltyBps: params.royaltyBps,
+      royaltyRecipient: params.royaltyRecipient,
+    });
+    const offerParams = {
+      ...params,
+      ...resolvedRoyalty,
+    };
 
     // Check ERC20 readiness
     const readiness = await this.seaport.checkErc20Readiness(
@@ -295,8 +450,10 @@ export class OpenOrderBook {
     // Fetch current protocol fee from API (cached 5 min)
     const protocolConfig = await this.api.getProtocolConfig();
 
-    const { order, signature } = await this.seaport.createOffer(params, wallet, pub, protocolConfig);
-    return this.api.submitOrder(order, signature);
+    const { order, signature } = await this.seaport.createOffer(offerParams, wallet, pub, protocolConfig);
+    return this.api.submitOrder(order, signature, {
+      metadata: this.buildSubmissionMetadata(offerParams),
+    });
   }
 
   /**
@@ -404,8 +561,9 @@ export class OpenOrderBook {
   async submitOrder(
     order: SeaportOrderComponents,
     signature: string,
+    params?: SubmitOrderParams,
   ): Promise<SubmitOrderResponse> {
-    return this.api.submitOrder(order, signature as Hex);
+    return this.api.submitOrder(order, signature as Hex, params);
   }
 
   // ═══════════════════════════════════════════════════════════════════════

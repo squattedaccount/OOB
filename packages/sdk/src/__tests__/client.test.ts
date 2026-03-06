@@ -10,7 +10,7 @@ vi.mock("viem", () => ({
 }));
 
 import { OpenOrderBook, NeedsApprovalError, InsufficientBalanceError } from "../client.js";
-import { DEFAULT_API_URL, DEFAULT_FEE_BPS, DEFAULT_FEE_RECIPIENT } from "../types.js";
+import { DEFAULT_API_URL, DEFAULT_ORIGIN_FEE_BPS, DEFAULT_ORIGIN_FEE_RECIPIENT, DEFAULT_ROYALTY_POLICY } from "../types.js";
 
 // Mock fetch globally
 const mockFetch = vi.fn();
@@ -28,8 +28,9 @@ describe("OpenOrderBook", () => {
     it("sets default config values", () => {
       expect(oob.config.chainId).toBe(8453);
       expect(oob.config.apiUrl).toBe(DEFAULT_API_URL);
-      expect(oob.config.feeBps).toBe(0);
-      expect(oob.config.feeRecipient).toBe("");
+      expect(oob.config.originFeeBps).toBe(DEFAULT_ORIGIN_FEE_BPS);
+      expect(oob.config.originFeeRecipient).toBe(DEFAULT_ORIGIN_FEE_RECIPIENT);
+      expect(oob.config.royaltyPolicy).toBe(DEFAULT_ROYALTY_POLICY);
     });
 
     it("accepts custom config", () => {
@@ -37,13 +38,14 @@ describe("OpenOrderBook", () => {
         chainId: 1,
         apiUrl: "https://custom.api",
         apiKey: "my-key",
-        feeBps: 100,
-        feeRecipient: "0x1234567890123456789012345678901234567890",
+        originFeeBps: 100,
+        originFeeRecipient: "0x1234567890123456789012345678901234567890",
       });
       expect(custom.config.chainId).toBe(1);
       expect(custom.config.apiUrl).toBe("https://custom.api");
       expect(custom.config.apiKey).toBe("my-key");
-      expect(custom.config.feeBps).toBe(100);
+      expect(custom.config.originFeeBps).toBe(100);
+      expect(custom.config.royaltyPolicy).toBe(DEFAULT_ROYALTY_POLICY);
     });
 
     it("exposes api and seaport sub-clients", () => {
@@ -222,6 +224,189 @@ describe("OpenOrderBook", () => {
       const result = await oob.submitOrder(order, "0xsig");
       expect(result.orderHash).toBe("0xhash");
       expect(result.status).toBe("active");
+    });
+  });
+
+  describe("royalty policy", () => {
+    const wallet = {
+      account: { address: "0x1234567890123456789012345678901234567890" },
+    } as any;
+
+    const protocolConfig = {
+      protocolFeeBps: 33,
+      protocolFeeRecipient: "0x0000000000000000000000000000000000000001",
+    };
+
+    const baseListingParams = {
+      collection: "0x1234567890123456789012345678901234567890",
+      tokenId: "1",
+      priceWei: "10000",
+    };
+
+    const baseOfferParams = {
+      collection: "0x1234567890123456789012345678901234567890",
+      tokenId: "1",
+      amountWei: "10000",
+      currency: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    };
+
+    function setupCreateListing(oobClient: OpenOrderBook, publicClientOverrides: Record<string, any> = {}) {
+      const publicClient = {
+        readContract: vi.fn(),
+        ...publicClientOverrides,
+      } as any;
+
+      oobClient.connect(wallet, publicClient);
+      vi.spyOn(oobClient.seaport, "isApprovedForAll").mockResolvedValue(true);
+      vi.spyOn(oobClient.api, "getProtocolConfig").mockResolvedValue(protocolConfig);
+      vi.spyOn(oobClient.seaport, "createListing").mockResolvedValue({
+        order: { offerer: wallet.account.address, consideration: [], offer: [] } as any,
+        signature: "0xsig" as any,
+      });
+      vi.spyOn(oobClient.api, "submitOrder").mockResolvedValue({ orderHash: "0xhash", status: "active" });
+      return publicClient;
+    }
+
+    function setupCreateOffer(oobClient: OpenOrderBook, publicClientOverrides: Record<string, any> = {}) {
+      const publicClient = {
+        readContract: vi.fn(),
+        ...publicClientOverrides,
+      } as any;
+
+      oobClient.connect(wallet, publicClient);
+      vi.spyOn(oobClient.seaport, "checkErc20Readiness").mockResolvedValue({
+        hasBalance: true,
+        hasAllowance: true,
+        balance: 10000n,
+        allowance: 10000n,
+      } as any);
+      vi.spyOn(oobClient.api, "getProtocolConfig").mockResolvedValue(protocolConfig);
+      vi.spyOn(oobClient.seaport, "createOffer").mockResolvedValue({
+        order: { offerer: wallet.account.address, consideration: [], offer: [] } as any,
+        signature: "0xsig" as any,
+      });
+      vi.spyOn(oobClient.api, "submitOrder").mockResolvedValue({ orderHash: "0xhash", status: "active" });
+      return publicClient;
+    }
+
+    it("manual_only embeds explicitly provided listing royalty", async () => {
+      const client = new OpenOrderBook({ chainId: 8453, royaltyPolicy: "manual_only" });
+      setupCreateListing(client);
+
+      await client.createListing({
+        ...baseListingParams,
+        royaltyRecipient: "0x2222222222222222222222222222222222222222",
+        royaltyBps: 500,
+      });
+
+      expect(client.seaport.createListing).toHaveBeenCalledWith(
+        expect.objectContaining({ royaltyRecipient: "0x2222222222222222222222222222222222222222", royaltyBps: 500 }),
+        expect.anything(),
+        expect.anything(),
+        protocolConfig,
+      );
+      expect(client.api.submitOrder).toHaveBeenCalledWith(
+        expect.anything(),
+        "0xsig",
+        expect.objectContaining({
+          metadata: expect.objectContaining({ royaltyRecipient: "0x2222222222222222222222222222222222222222", royaltyBps: 500 }),
+        }),
+      );
+    });
+
+    it("manual_only accepts explicit royalty above the origin fee cap", async () => {
+      const client = new OpenOrderBook({ chainId: 8453, royaltyPolicy: "manual_only" });
+      setupCreateListing(client);
+
+      await expect(client.createListing({
+        ...baseListingParams,
+        royaltyRecipient: "0x2222222222222222222222222222222222222222",
+        royaltyBps: 750,
+      })).resolves.toEqual({ orderHash: "0xhash", status: "active" });
+
+      expect(client.seaport.createListing).toHaveBeenCalledWith(
+        expect.objectContaining({ royaltyRecipient: "0x2222222222222222222222222222222222222222", royaltyBps: 750 }),
+        expect.anything(),
+        expect.anything(),
+        protocolConfig,
+      );
+    });
+
+    it("off strips explicitly provided listing royalty", async () => {
+      const client = new OpenOrderBook({ chainId: 8453, royaltyPolicy: "off" });
+      setupCreateListing(client);
+
+      await client.createListing({
+        ...baseListingParams,
+        royaltyRecipient: "0x2222222222222222222222222222222222222222",
+        royaltyBps: 500,
+      });
+
+      expect(client.seaport.createListing).toHaveBeenCalledWith(
+        expect.not.objectContaining({ royaltyRecipient: "0x2222222222222222222222222222222222222222", royaltyBps: 500 }),
+        expect.anything(),
+        expect.anything(),
+        protocolConfig,
+      );
+      expect(client.api.submitOrder).toHaveBeenCalledWith(
+        expect.anything(),
+        "0xsig",
+        expect.objectContaining({ metadata: undefined }),
+      );
+    });
+
+    it("auto_eip2981 resolves listing royalty from royaltyInfo", async () => {
+      const client = new OpenOrderBook({ chainId: 8453, royaltyPolicy: "auto_eip2981" });
+      const publicClient = setupCreateListing(client);
+      publicClient.readContract.mockResolvedValue(["0x3333333333333333333333333333333333333333", 500n]);
+
+      await client.createListing(baseListingParams);
+
+      expect(publicClient.readContract).toHaveBeenCalled();
+      expect(client.seaport.createListing).toHaveBeenCalledWith(
+        expect.objectContaining({ royaltyRecipient: "0x3333333333333333333333333333333333333333", royaltyBps: 500 }),
+        expect.anything(),
+        expect.anything(),
+        protocolConfig,
+      );
+    });
+
+    it("auto_eip2981 skips lookup for collection offers and keeps no royalty", async () => {
+      const client = new OpenOrderBook({ chainId: 8453, royaltyPolicy: "auto_eip2981" });
+      const publicClient = setupCreateOffer(client);
+
+      await client.createOffer({
+        collection: baseOfferParams.collection,
+        amountWei: baseOfferParams.amountWei,
+        currency: baseOfferParams.currency,
+      });
+
+      expect(publicClient.readContract).not.toHaveBeenCalled();
+      expect(client.seaport.createOffer).toHaveBeenCalledWith(
+        expect.not.objectContaining({ royaltyBps: expect.anything(), royaltyRecipient: expect.anything() }),
+        expect.anything(),
+        expect.anything(),
+        protocolConfig,
+      );
+    });
+
+    it("explicit royalty takes precedence over auto_eip2981", async () => {
+      const client = new OpenOrderBook({ chainId: 8453, royaltyPolicy: "auto_eip2981" });
+      const publicClient = setupCreateOffer(client);
+
+      await client.createOffer({
+        ...baseOfferParams,
+        royaltyRecipient: "0x4444444444444444444444444444444444444444",
+        royaltyBps: 250,
+      });
+
+      expect(publicClient.readContract).not.toHaveBeenCalled();
+      expect(client.seaport.createOffer).toHaveBeenCalledWith(
+        expect.objectContaining({ royaltyRecipient: "0x4444444444444444444444444444444444444444", royaltyBps: 250 }),
+        expect.anything(),
+        expect.anything(),
+        protocolConfig,
+      );
     });
   });
 

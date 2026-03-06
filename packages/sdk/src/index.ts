@@ -32,6 +32,8 @@ export { SeaportClient } from "./seaport.js";
 export type {
   OobConfig,
   ProtocolConfig,
+  RoyaltyPolicyMode,
+  OrderSubmissionMetadata,
   OobOrder,
   OrderStatus,
   SeaportOrderComponents,
@@ -62,8 +64,10 @@ export {
   OrderType,
   SUPPORTED_CHAINS,
   DEFAULT_API_URL,
-  DEFAULT_FEE_BPS,
-  DEFAULT_FEE_RECIPIENT,
+  DEFAULT_ORIGIN_FEE_BPS,
+  DEFAULT_ORIGIN_FEE_RECIPIENT,
+  DEFAULT_ROYALTY_POLICY,
+  MAX_ORIGIN_FEE_BPS,
   DEFAULT_LISTING_DURATION,
   DEFAULT_OFFER_DURATION,
 } from "./types.js";

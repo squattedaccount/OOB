@@ -2,13 +2,14 @@
  * Order routes — GET, POST, DELETE for /v1/orders
  */
 
-import type { RouteContext, Env } from "../types.js";
+import type { RouteContext, Env, SubmitOrderBody, OrderSubmissionMetadata } from "../types.js";
 import type { SqlClient } from "../db.js";
 import { getPooledSqlClient } from "../db.js";
 import { jsonResponse, jsonError } from "../response.js";
 import { computeOrderHash } from "../seaportHash.js";
 import { logActivity } from "../activity.js";
 import { resolveCurrency, formatPriceDecimal } from "../currency.js";
+import { parseOrderDetails, validateFeeEnforcement } from "../fees.js";
 import { RedisCache, CacheKeys, getCacheConfig, hashQueryParams } from "../cache.js";
 import {
   recoverTypedDataAddress,
@@ -26,6 +27,7 @@ const ORDER_HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 const VALID_CHAINS = new Set([1, 8453, 84532, 999, 2020, 202601, 2741]);
 const MAX_BODY_SIZE = 64 * 1024; // 64 KB
 const MAX_ACTIVE_ORDERS_PER_OFFERER = 500;
+const MAX_ORIGIN_FEE_BPS = 500;
 
 function isValidAddress(addr: string): boolean {
   return ETH_ADDRESS_RE.test(addr);
@@ -282,261 +284,6 @@ async function readBodyWithLimit(request: Request, maxBytes: number): Promise<st
   return new TextDecoder().decode(merged);
 }
 
-function safeBigInt(val: unknown): bigint {
-  try {
-    return BigInt(String(val || "0"));
-  } catch {
-    return 0n;
-  }
-}
-
-// ─── Shared Order Parsing ───────────────────────────────────────────────────
-
-interface ParsedOrderDetails {
-  orderType: "listing" | "offer";
-  nftContract: string;
-  tokenId: string;
-  tokenStandard: string;
-  priceWei: bigint;
-  currency: string;
-  feeRecipient: string;
-  feeBps: number;
-  royaltyRecipient: string;
-  royaltyBps: number;
-}
-
-/**
- * Extract NFT, price, fee, and royalty details from a Seaport order.
- * Shared between single-submit and batch-submit paths.
- * Returns null with an error string if the order cannot be parsed.
- */
-function parseOrderDetails(
-  order: any,
-  offerer: string,
-  protocolFeeRecipient: string,
-): { ok: true; parsed: ParsedOrderDetails } | { ok: false; error: string } {
-  const offerItems: any[] = order.offer || [];
-  const considerationItems: any[] = order.consideration || [];
-  const OOB_FEE = protocolFeeRecipient.toLowerCase();
-
-  let orderType: "listing" | "offer";
-  let nftContract: string;
-  let tokenId: string;
-  let tokenStandard: string;
-  let priceWei: bigint;
-  let currency: string;
-  let feeRecipient = "";
-  let feeBps = 0;
-  let royaltyRecipient = "";
-  let royaltyBps = 0;
-
-  const nftInOffer = offerItems.find((i: any) => Number(i.itemType) === 2 || Number(i.itemType) === 3);
-  const nftInConsideration = considerationItems.find((i: any) => Number(i.itemType) === 2 || Number(i.itemType) === 3);
-
-  if (nftInOffer) {
-    orderType = "listing";
-    nftContract = (nftInOffer.token || "").toLowerCase();
-    tokenId = String(nftInOffer.identifierOrCriteria || "0");
-    tokenStandard = Number(nftInOffer.itemType) === 2 ? "ERC721" : "ERC1155";
-    priceWei = 0n;
-    currency = "0x0000000000000000000000000000000000000000";
-
-    for (const item of considerationItems) {
-      const it = Number(item.itemType);
-      if (it === 0 || it === 1) {
-        priceWei += safeBigInt(item.startAmount);
-        if (it === 1) currency = (item.token || "").toLowerCase();
-        const recipient = (item.recipient || "").toLowerCase();
-        if (recipient !== offerer) {
-          if (recipient === OOB_FEE) {
-            feeRecipient = recipient;
-          } else if (!royaltyRecipient) {
-            royaltyRecipient = recipient;
-          }
-        }
-      }
-    }
-
-    if (priceWei > 0n) {
-      if (feeRecipient) {
-        const feeItem = considerationItems.find(
-          (i: any) => (i.recipient || "").toLowerCase() === feeRecipient && (Number(i.itemType) === 0 || Number(i.itemType) === 1),
-        );
-        if (feeItem) feeBps = Number((safeBigInt(feeItem.startAmount) * 10000n) / priceWei);
-      }
-      if (royaltyRecipient) {
-        let totalRoyaltyAmount = 0n;
-        for (const item of considerationItems) {
-          const it = Number(item.itemType);
-          if (it === 0 || it === 1) {
-            const r = (item.recipient || "").toLowerCase();
-            if (r !== offerer && r !== OOB_FEE) {
-              totalRoyaltyAmount += safeBigInt(item.startAmount);
-            }
-          }
-        }
-        if (totalRoyaltyAmount > 0n) royaltyBps = Number((totalRoyaltyAmount * 10000n) / priceWei);
-      }
-    }
-  } else if (nftInConsideration) {
-    orderType = "offer";
-    nftContract = (nftInConsideration.token || "").toLowerCase();
-    tokenId = String(nftInConsideration.identifierOrCriteria || "0");
-    tokenStandard = Number(nftInConsideration.itemType) === 2 ? "ERC721" : "ERC1155";
-    priceWei = 0n;
-    currency = "0x0000000000000000000000000000000000000000";
-    for (const item of offerItems) {
-      const it = Number(item.itemType);
-      if (it === 0 || it === 1) {
-        priceWei += safeBigInt(item.startAmount);
-        if (it === 1) currency = (item.token || "").toLowerCase();
-      }
-    }
-    // Fee/royalty from consideration (non-NFT items going to non-offerer)
-    for (const item of considerationItems) {
-      const it = Number(item.itemType);
-      if ((it === 0 || it === 1) && (item.recipient || "").toLowerCase() !== offerer) {
-        const recipient = (item.recipient || "").toLowerCase();
-        const amount = safeBigInt(item.startAmount);
-        if (recipient === OOB_FEE) {
-          feeRecipient = recipient;
-          if (priceWei > 0n) feeBps = Number((amount * 10000n) / priceWei);
-        } else {
-          royaltyRecipient = recipient;
-          if (priceWei > 0n) royaltyBps = Number((amount * 10000n) / priceWei);
-        }
-      }
-    }
-  } else {
-    return { ok: false, error: "Order must contain an NFT in offer or consideration" };
-  }
-
-  if (!nftContract || !isValidAddress(nftContract)) {
-    return { ok: false, error: "Invalid NFT contract address in order" };
-  }
-  if (priceWei <= 0n) {
-    return { ok: false, error: "Order price must be greater than zero" };
-  }
-
-  return {
-    ok: true,
-    parsed: {
-      orderType, nftContract, tokenId, tokenStandard,
-      priceWei, currency, feeRecipient, feeBps,
-      royaltyRecipient, royaltyBps,
-    },
-  };
-}
-
-// ─── Fee Enforcement ────────────────────────────────────────────────────────
-
-/**
- * Validate that a submitted order includes our fee recipient with at least
- * the minimum required fee. Returns null if valid, or an error string.
- */
-function validateFeeEnforcement(
-  order: any,
-  env: { PROTOCOL_FEE_RECIPIENT: string; PROTOCOL_FEE_BPS?: string },
-): string | null {
-  const requiredRecipient = (env.PROTOCOL_FEE_RECIPIENT || "").toLowerCase();
-  if (!requiredRecipient || !ETH_ADDRESS_RE.test(requiredRecipient)) {
-    return "Protocol fee enforcement is not configured";
-  }
-
-  const minFeeBps = Number(env.PROTOCOL_FEE_BPS || "50"); // default 0.5%
-  if (!Number.isFinite(minFeeBps) || !Number.isInteger(minFeeBps) || minFeeBps <= 0 || minFeeBps > 10000) {
-    return "Protocol fee BPS misconfigured: must be an integer between 1 and 10000";
-  }
-
-  const offerItems: any[] = order.offer || [];
-  const considerationItems: any[] = order.consideration || [];
-
-  // Reject variable amount (ascending/descending) orders for fungible items.
-  // We require fixed prices to ensure fee enforcement is correct at fill time.
-  for (const item of [...offerItems, ...considerationItems]) {
-    const it = Number(item?.itemType);
-    if (it === 0 || it === 1) {
-      const start = String(item?.startAmount ?? "0");
-      const end = String(item?.endAmount ?? "0");
-      if (start !== end) {
-        return "Fungible items must have startAmount === endAmount";
-      }
-    }
-  }
-
-  // Enforce single payment currency: all fungible items must share the same (itemType, token).
-  // Prevents fee bypass via inflated junk-token amounts.
-  let paymentItemType: number | null = null;
-  let paymentToken: string | null = null;
-  for (const item of [...offerItems, ...considerationItems]) {
-    const it = Number(item?.itemType);
-    if (it === 0 || it === 1) {
-      const token = (item.token || "0x0000000000000000000000000000000000000000").toLowerCase();
-      if (paymentItemType === null) {
-        paymentItemType = it;
-        paymentToken = token;
-      } else if (it !== paymentItemType || token !== paymentToken) {
-        return "All fungible items must use the same payment currency";
-      }
-    }
-  }
-
-  // Determine total price from the order
-  const nftInOffer = offerItems.find(
-    (i: any) => Number(i.itemType) === 2 || Number(i.itemType) === 3,
-  );
-  const nftInConsideration = considerationItems.find(
-    (i: any) => Number(i.itemType) === 2 || Number(i.itemType) === 3,
-  );
-
-  let totalPriceWei = 0n;
-  let feeAmountWei = 0n;
-
-  if (nftInOffer) {
-    // LISTING: price is sum of all native/ERC20 consideration items
-    for (const item of considerationItems) {
-      const it = Number(item.itemType);
-      if (it === 0 || it === 1) {
-        totalPriceWei += safeBigInt(item.startAmount);
-        if ((item.recipient || "").toLowerCase() === requiredRecipient) {
-          feeAmountWei += safeBigInt(item.startAmount);
-        }
-      }
-    }
-  } else if (nftInConsideration) {
-    // OFFER: price is sum of all native/ERC20 offer items
-    for (const item of offerItems) {
-      const it = Number(item.itemType);
-      if (it === 0 || it === 1) {
-        totalPriceWei += safeBigInt(item.startAmount);
-      }
-    }
-    // Fee for offers is in consideration (non-NFT items going to fee recipient)
-    for (const item of considerationItems) {
-      const it = Number(item.itemType);
-      if ((it === 0 || it === 1) && (item.recipient || "").toLowerCase() === requiredRecipient) {
-        feeAmountWei += safeBigInt(item.startAmount);
-      }
-    }
-  }
-
-  if (totalPriceWei <= 0n) {
-    return null; // price validation happens elsewhere
-  }
-
-  if (feeAmountWei <= 0n) {
-    return `Order must include a fee payment to ${requiredRecipient} (minimum ${minFeeBps / 100}%)`;
-  }
-
-  // Check fee meets minimum BPS
-  const actualBps = Number((feeAmountWei * 10000n) / totalPriceWei);
-  if (actualBps < minFeeBps) {
-    return `Fee too low: ${actualBps} bps (minimum ${minFeeBps} bps / ${minFeeBps / 100}%). Fee recipient: ${requiredRecipient}`;
-  }
-
-  return null; // valid
-}
-
 // ─── Helper: map DB row → API response ──────────────────────────────────────
 
 function mapRowToOrder(row: any) {
@@ -554,8 +301,10 @@ function mapRowToOrder(row: any) {
     currencySymbol: cm.currencySymbol,
     currencyDecimals: cm.currencyDecimals,
     priceDecimal: formatPriceDecimal(row.price_wei, cm.currencyDecimals),
-    feeRecipient: row.fee_recipient,
-    feeBps: row.fee_bps,
+    protocolFeeRecipient: row.protocol_fee_recipient,
+    protocolFeeBps: row.protocol_fee_bps,
+    originFeeRecipient: row.origin_fee_recipient || null,
+    originFeeBps: row.origin_fee_bps || 0,
     royaltyRecipient: row.royalty_recipient || null,
     royaltyBps: row.royalty_bps || 0,
     startTime: Number(row.start_time),
@@ -976,14 +725,14 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
     return jsonError(400, "Failed to read request body");
   }
 
-  let body: any;
+  let body: SubmitOrderBody & { metadata?: OrderSubmissionMetadata };
   try {
     body = JSON.parse(rawBody);
   } catch {
     return jsonError(400, "Invalid JSON body");
   }
 
-  const { chainId, order, signature } = body;
+  const { chainId, order, signature, metadata } = body;
   if (!chainId || !order || !signature) {
     return jsonError(400, "Missing required fields: chainId, order, signature");
   }
@@ -1038,11 +787,24 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
 
   // Determine order type and extract NFT + price details (shared helper)
   const OOB_FEE_RECIPIENT = (ctx.env.PROTOCOL_FEE_RECIPIENT || "0x0000000000000000000000000000000000000001");
-  const parseResult = parseOrderDetails(order, offerer, OOB_FEE_RECIPIENT);
+  const parseResult = parseOrderDetails(order, offerer, OOB_FEE_RECIPIENT, metadata);
   if (!parseResult.ok) {
     return jsonError(400, parseResult.error);
   }
-  const { orderType, nftContract, tokenId, tokenStandard, priceWei, currency, feeRecipient, feeBps, royaltyRecipient, royaltyBps } = parseResult.parsed;
+  const {
+    orderType,
+    nftContract,
+    tokenId,
+    tokenStandard,
+    priceWei,
+    currency,
+    protocolFeeRecipient,
+    protocolFeeBps,
+    originFeeRecipient,
+    originFeeBps,
+    royaltyRecipient,
+    royaltyBps,
+  } = parseResult.parsed;
 
   // Compute the real Seaport EIP-712 order hash (matches on-chain events)
   const orderHash = computeOrderHash(order, Number(chainId));
@@ -1103,8 +865,10 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
         zone,
         startTime,
         endTime,
-        feeRecipient,
-        feeBps,
+        protocolFeeRecipient,
+        protocolFeeBps,
+        originFeeRecipient: originFeeRecipient || null,
+        originFeeBps,
         royaltyRecipient: royaltyRecipient || null,
         royaltyBps,
       });
@@ -1124,7 +888,8 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
         order_hash, chain_id, order_type, offerer, zone,
         nft_contract, token_id, token_standard,
         price_wei, currency,
-        fee_recipient, fee_bps,
+        protocol_fee_recipient, protocol_fee_bps,
+        origin_fee_recipient, origin_fee_bps,
         royalty_recipient, royalty_bps,
         order_json, signature,
         start_time, end_time,
@@ -1134,7 +899,8 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
         ${orderHash}, ${Number(chainId)}, ${orderType}, ${offerer}, ${zone},
         ${nftContract}, ${tokenId}, ${tokenStandard},
         ${priceWei.toString()}, ${currency},
-        ${feeRecipient}, ${feeBps},
+        ${protocolFeeRecipient}, ${protocolFeeBps},
+        ${originFeeRecipient || null}, ${originFeeBps},
         ${royaltyRecipient || null}, ${royaltyBps},
         ${JSON.stringify(order)}, ${signature},
         ${startTime}, ${endTime},
@@ -1523,6 +1289,7 @@ interface BatchOrderInput {
   chainId: number;
   order: any;
   signature: string;
+  metadata?: OrderSubmissionMetadata;
 }
 
 interface BatchSubmitResult {
@@ -1584,7 +1351,7 @@ async function processSingleOrderSubmit(
   item: BatchOrderInput,
   env: Env,
 ): Promise<BatchSubmitResult> {
-  const { chainId, order, signature } = item;
+  const { chainId, order, signature, metadata } = item;
 
   if (!chainId || !order || !signature) {
     return { orderHash: "", status: "error", error: "Missing required fields: chainId, order, signature" };
@@ -1633,11 +1400,24 @@ async function processSingleOrderSubmit(
 
   // Extract NFT + price details (shared helper)
   const OOB_FEE_RECIPIENT = (env.PROTOCOL_FEE_RECIPIENT || "0x0000000000000000000000000000000000000001");
-  const parseResult = parseOrderDetails(order, offerer, OOB_FEE_RECIPIENT);
+  const parseResult = parseOrderDetails(order, offerer, OOB_FEE_RECIPIENT, metadata);
   if (!parseResult.ok) {
     return { orderHash: "", status: "error", error: parseResult.error };
   }
-  const { orderType, nftContract, tokenId, tokenStandard, priceWei, currency, feeRecipient, feeBps, royaltyRecipient, royaltyBps } = parseResult.parsed;
+  const {
+    orderType,
+    nftContract,
+    tokenId,
+    tokenStandard,
+    priceWei,
+    currency,
+    protocolFeeRecipient,
+    protocolFeeBps,
+    originFeeRecipient,
+    originFeeBps,
+    royaltyRecipient,
+    royaltyBps,
+  } = parseResult.parsed;
 
   const orderHash = computeOrderHash(order, Number(chainId));
 
@@ -1676,7 +1456,8 @@ async function processSingleOrderSubmit(
       order_hash, chain_id, order_type, offerer, zone,
       nft_contract, token_id, token_standard,
       price_wei, currency,
-      fee_recipient, fee_bps,
+      protocol_fee_recipient, protocol_fee_bps,
+      origin_fee_recipient, origin_fee_bps,
       royalty_recipient, royalty_bps,
       order_json, signature,
       start_time, end_time, status
@@ -1685,7 +1466,8 @@ async function processSingleOrderSubmit(
       ${orderHash}, ${Number(chainId)}, ${orderType}, ${offerer}, ${zone},
       ${nftContract}, ${tokenId}, ${tokenStandard},
       ${priceWei.toString()}, ${currency},
-      ${feeRecipient}, ${feeBps},
+      ${protocolFeeRecipient}, ${protocolFeeBps},
+      ${originFeeRecipient || null}, ${originFeeBps},
       ${royaltyRecipient || null}, ${royaltyBps},
       ${JSON.stringify(order)}, ${signature},
       ${startTime}, ${endTime}, 'active'

@@ -54,8 +54,12 @@ export interface OobOrder {
   tokenStandard: "ERC721" | "ERC1155";
   priceWei: string;
   currency: string;
-  feeRecipient: string;
-  feeBps: number;
+  protocolFeeRecipient: string;
+  protocolFeeBps: number;
+  originFeeRecipient: string | null;
+  originFeeBps: number;
+  royaltyRecipient: string | null;
+  royaltyBps: number;
   startTime: number;
   endTime: number;
   status: OrderStatus;
@@ -108,11 +112,15 @@ export interface OobConfig {
   apiUrl?: string;
   /** Optional API key for higher rate limits */
   apiKey?: string;
-  /** Marketplace fee in basis points (your marketplace's cut). Defaults to 0. */
-  feeBps?: number;
-  /** Marketplace fee recipient address. Required if feeBps > 0. */
-  feeRecipient?: string;
+  /** Optional origin fee in basis points for the marketplace/integrator creating the order. Defaults to 0. */
+  originFeeBps?: number;
+  /** Origin fee recipient address. Required if originFeeBps > 0. */
+  originFeeRecipient?: string;
+  /** Royalty inclusion policy for SDK-created orders. Defaults to manual_only. */
+  royaltyPolicy?: RoyaltyPolicyMode;
 }
+
+export type RoyaltyPolicyMode = "off" | "manual_only" | "auto_eip2981";
 
 /**
  * Protocol fee config returned by GET /v1/config.
@@ -123,9 +131,18 @@ export interface ProtocolConfig {
   protocolFeeRecipient: string;
 }
 
+export interface OrderSubmissionMetadata {
+  originFeeRecipient?: string;
+  originFeeBps?: number;
+  royaltyRecipient?: string;
+  royaltyBps?: number;
+}
+
 export const DEFAULT_API_URL = "https://api.openorderbook.xyz";
-export const DEFAULT_FEE_BPS = 0;
-export const DEFAULT_FEE_RECIPIENT = "";
+export const DEFAULT_ORIGIN_FEE_BPS = 0;
+export const DEFAULT_ORIGIN_FEE_RECIPIENT = "";
+export const DEFAULT_ROYALTY_POLICY: RoyaltyPolicyMode = "manual_only";
+export const MAX_ORIGIN_FEE_BPS = 500;
 export const DEFAULT_LISTING_DURATION = 30 * 24 * 60 * 60; // 30 days
 export const DEFAULT_OFFER_DURATION = 7 * 24 * 60 * 60; // 7 days
 
@@ -214,6 +231,10 @@ export interface SubmitOrderResponse {
   orderHash: string;
   status: string;
   duplicate?: boolean;
+}
+
+export interface SubmitOrderParams {
+  metadata?: OrderSubmissionMetadata;
 }
 
 export interface CollectionStatsResponse {

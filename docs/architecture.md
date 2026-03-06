@@ -306,17 +306,17 @@ The Open Order Book's fee model is **cryptographically enforced** — no trust r
 
 ### How fees are embedded
 
-When a listing is created for 1 ETH with a 0.5% protocol fee:
+When a listing is created for 1 ETH with a 0.33% protocol fee:
 
 ```json
 {
   "consideration": [
     {
-      "amount": "995000000000000000",
+      "amount": "996700000000000000",
       "recipient": "0xSeller"
     },
     {
-      "amount": "5000000000000000",
+      "amount": "3300000000000000",
       "recipient": "0xOOBTreasury"
     }
   ]
@@ -331,8 +331,8 @@ Seaport allows the fulfiller (buyer) to add extra consideration items at fill ti
 
 ```
 Original order consideration:
-  → 0.995 ETH to Seller
-  → 0.005 ETH to OOB
+  → 0.9967 ETH to Seller
+  → 0.0033 ETH to OOB
 
 Fulfiller adds tip:
   → 0.01 ETH to Marketplace

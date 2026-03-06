@@ -112,7 +112,12 @@ const { txHash: cancelTx } = await oob.cancelOrder(listing.orderHash);
 
 ## For Marketplaces: Add Your Own Fee
 
-If you're building a marketplace on top of the Open Order Book, you can add your own fee using Seaport's **tipping mechanism**:
+If you're building a marketplace or integrator on top of the Open Order Book, you have two fee surfaces:
+
+- configure an optional **origin fee** when creating orders
+- add an optional buyer-side fee using Seaport's **tipping mechanism** when filling orders
+
+Buyer-side tip example:
 
 ```typescript
 const txHash = await oob.fillOrder('0xOrderHash', {
@@ -123,9 +128,9 @@ const txHash = await oob.fillOrder('0xOrderHash', {
 });
 ```
 
-The buyer pays: **item price + OOB protocol fee (0.5%) + your marketplace fee (as tip)**.
+The buyer pays: **item price + your marketplace fee (as tip)**.
 
-Both fees are enforced at the smart contract level in a single atomic transaction. No trust required.
+The OOB protocol fee is embedded in the signed order. Your buyer-side tip is optional app-layer behavior in MVP and can be bypassed by direct fills outside your marketplace flow.
 
 ## For Bots & AI Agents
 
@@ -189,8 +194,21 @@ new OpenOrderBook(config: OobConfig)
 | `chainId` | `number` | *required* | Chain ID to operate on |
 | `apiUrl` | `string` | `https://api.openorderbook.xyz` | API base URL |
 | `apiKey` | `string` | — | Optional key for higher rate limits |
-| `feeBps` | `number` | `50` | Protocol fee in basis points (0.5%) |
-| `feeRecipient` | `string` | OOB treasury | Fee recipient address |
+| `originFeeBps` | `number` | `0` | Optional origin fee in basis points for marketplace/integrator-created orders |
+| `originFeeRecipient` | `string` | — | Required if `originFeeBps > 0` |
+| `royaltyPolicy` | `'off' \| 'manual_only' \| 'auto_eip2981'` | `'manual_only'` | Controls whether the SDK ignores royalties, requires explicit royalty inputs, or auto-resolves via EIP-2981 |
+
+### Royalty policy modes
+
+- `manual_only` — no automatic royalty lookup; your marketplace explicitly decides royalty, and if you provide `royaltyRecipient` plus `royaltyBps`, the SDK embeds them into the signed order
+- `off` — the SDK does not embed royalties when creating orders
+- `auto_eip2981` — if you do not provide explicit royalty fields, the SDK attempts to call `royaltyInfo(tokenId, salePrice)` and embed the returned royalty when available
+
+Explicit royalty params still take precedence over auto-resolution in `auto_eip2981` mode.
+
+`auto_eip2981` only auto-resolves for token-specific listings and token-specific offers. It does not auto-resolve for collection offers, because the final `tokenId` is not known when the order is created.
+
+For collection offers, marketplaces must decide royalty explicitly if they want it embedded in the signed order.
 
 ### Read Methods (no wallet needed)
 
@@ -213,7 +231,7 @@ new OpenOrderBook(config: OobConfig)
 | `createOffer(params)` | `{ orderHash, status }` | Sign and submit an offer |
 | `fillOrder(hash, params?)` | `txHash` | Buy/accept an order on-chain |
 | `cancelOrder(hash)` | `{ txHash, apiStatus }` | Cancel on-chain + notify API |
-| `submitOrder(order, signature)` | `{ orderHash, status }` | Submit a pre-signed order (for bots) |
+| `submitOrder(order, signature, params?)` | `{ orderHash, status }` | Submit a pre-signed order with optional fee/royalty metadata |
 
 ### Utility Methods
 
@@ -233,11 +251,15 @@ new OpenOrderBook(config: OobConfig)
 
 ## Fees
 
-The Open Order Book charges a **0.5% protocol fee** (50 basis points) on all orders created through the SDK or API.
+The Open Order Book charges a **0.33% protocol fee** (33 basis points) on all orders created through the SDK or API.
 
 - The fee is embedded in the signed order — it cannot be removed or bypassed
 - The fee is enforced by the Seaport smart contract at settlement time
-- Third-party marketplaces can add their own fee on top via the tipping mechanism
+- Marketplaces and integrators can optionally add an embedded `originFee` when creating orders
+- SDK royalty behavior is controlled by `royaltyPolicy`: `manual_only`, `off`, or `auto_eip2981`
+- If royalty is embedded in the signed order, it is non-bypassable everywhere that order is filled
+- `submitOrder(..., { metadata })` can explicitly declare `originFee` and `royalty` semantics for pre-signed orders so the API preserves the intended classification
+- Third-party marketplaces can optionally add a buyer-side fee on top via the tipping mechanism
 
 ## Contributing
 

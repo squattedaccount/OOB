@@ -163,6 +163,44 @@ describe("ApiClient", () => {
       expect(body.chainId).toBe(8453);
       expect(body.order).toEqual(order);
       expect(body.signature).toBe("0xsig");
+      expect(body.metadata).toBeUndefined();
+    });
+
+    it("sends explicit submission metadata when provided", async () => {
+      mockFetch.mockResolvedValue(
+        new Response(JSON.stringify({ orderHash: "0xhash", status: "active" }), { status: 201 }),
+      );
+
+      const order = {
+        offerer: "0x1234",
+        zone: "0x0000000000000000000000000000000000000000",
+        offer: [],
+        consideration: [],
+        orderType: 0 as const,
+        startTime: "100",
+        endTime: "200",
+        zoneHash: "0x" + "0".repeat(64),
+        salt: "1",
+        conduitKey: "0x" + "0".repeat(64),
+        counter: "0",
+      };
+
+      await api.submitOrder(order, "0xsig", {
+        metadata: {
+          originFeeRecipient: "0x2222222222222222222222222222222222222222",
+          originFeeBps: 100,
+          royaltyRecipient: "0x3333333333333333333333333333333333333333",
+          royaltyBps: 500,
+        },
+      });
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.metadata).toEqual({
+        originFeeRecipient: "0x2222222222222222222222222222222222222222",
+        originFeeBps: 100,
+        royaltyRecipient: "0x3333333333333333333333333333333333333333",
+        royaltyBps: 500,
+      });
     });
   });
 

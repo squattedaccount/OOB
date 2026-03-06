@@ -29,8 +29,9 @@ You don't need to be technical to benefit from the Open Order Book. Here's what 
 
 ### What are the fees?
 
-- **0.5% protocol fee** — taken from the sale price, embedded in your signed order
-- **Marketplace fee** — the marketplace where the buyer clicks "Buy" may add their own fee (paid by the buyer as a tip, doesn't reduce your earnings)
+- **0.33% protocol fee** — taken from the sale price, embedded in your signed order
+- **Origin fee** — an optional fee set by the marketplace or integrator that created the order, embedded in the signed order if present
+- **Marketplace buyer fee** — the marketplace where the buyer clicks "Buy" may add their own fee as a tip (paid by the buyer, doesn't reduce your earnings)
 - **Creator royalty** — if the marketplace supports it, royalties are also embedded in the order
 
 ### Can I cancel my listing?
@@ -100,7 +101,12 @@ const txHash = await oob.fillOrder(orderHash);
 
 ### Step 3: Add your marketplace fee
 
-You earn money by adding a tip when your users fill orders:
+You can earn money in two ways:
+
+- add an embedded `originFee` when your marketplace creates the order
+- add a tip when your users fill orders through your marketplace UI
+
+Buyer-side tip example:
 
 ```typescript
 const txHash = await oob.fillOrder(orderHash, {
@@ -112,9 +118,9 @@ const txHash = await oob.fillOrder(orderHash, {
 ```
 
 **How it works technically:**
-- The original order has the OOB protocol fee (0.5%) baked in
+- The original order has the OOB protocol fee (0.33%) baked in
 - Your tip is added as an extra `consideration` item at fill time
-- The buyer pays: item price + 0.5% protocol fee + your 1% tip
+- The buyer pays: item price + your 1% tip
 - Seaport settles everything in one atomic transaction
 - If any part fails, the entire transaction reverts — no partial fills
 
@@ -122,8 +128,8 @@ const txHash = await oob.fillOrder(orderHash, {
 
 | Recipient | Amount | Source |
 |---|---|---|
-| Seller | 0.995 ETH | From the signed order |
-| OOB Protocol | 0.005 ETH (0.5%) | From the signed order |
+| Seller | 0.9967 ETH | From the signed order |
+| OOB Protocol | 0.0033 ETH (0.33%) | From the signed order |
 | Your Marketplace | 0.01 ETH (1%) | Tip added at fill time |
 | **Buyer pays** | **1.01 ETH** | Total |
 
@@ -323,13 +329,21 @@ The API returns all data needed for on-chain execution in the `orderJson` and `s
 
 ## Understanding Fees
 
-### Protocol fee (0.5%)
+### Protocol fee (0.33%)
 
-The Open Order Book charges 0.5% (50 basis points) on every order. This fee is:
+The Open Order Book charges 0.33% (33 basis points) on every order. This fee is:
 
 - **Embedded in the signed order** — it's part of the `consideration` array
 - **Enforced by the Seaport smart contract** — cannot be bypassed
 - **Paid by the seller** (deducted from the sale price for listings) or **paid from the offer amount** (for offers)
+
+### Origin fee (optional)
+
+Marketplaces and integrators can optionally embed an `originFee` when they create an order. This fee is:
+
+- **Embedded in the signed order** — becomes non-bypassable once the order is signed
+- **Paid on every fill** — whether the order is filled on a marketplace or directly via API
+- **Set by the originator** — OOB does not require it by default
 
 ### Marketplace tip (variable)
 
@@ -337,11 +351,31 @@ Third-party marketplaces can add their own fee when filling orders. This is impl
 
 - **Added at fill time** — not part of the original signed order
 - **Paid by the buyer** — on top of the listing price
+- **Optional in MVP** — direct/API fills can bypass it
 - **Enforced by Seaport** — atomic, all-or-nothing
 
 ### Creator royalties (optional)
 
-If the listing marketplace supports royalties, they are embedded in the order's `consideration` array, similar to the protocol fee.
+Marketplaces decide whether to include royalties when they create an order.
+
+- If royalty is included in the signed order, it is embedded in the order's `consideration` array and becomes non-bypassable on every fill.
+- That means the royalty still applies if the order is filled on another marketplace, via direct API flow, or via a direct Seaport call.
+- If royalty is not included at order-creation time, OOB does not enforce it later.
+- `auto_eip2981` only auto-resolves for token-specific orders, because EIP-2981 requires a concrete `tokenId` and sale price.
+- A collection offer does not target one specific NFT. It is an offer to buy any token from a collection that matches the order criteria, so the final `tokenId` is only known when a seller accepts it.
+- Because of that, marketplaces must decide royalty explicitly for collection offers if they want royalty embedded in the signed order.
+
+### Collection offers and royalties
+
+For token-specific listings and token-specific offers, a marketplace can use `royaltyPolicy = auto_eip2981` and let the SDK resolve royalty automatically when no explicit royalty is supplied.
+
+For collection offers, the marketplace has to choose one of these approaches:
+
+- embed no royalty
+- embed an explicit royalty chosen by the marketplace
+- avoid collection offers when exact token-level royalty enforcement is required
+
+OOB does not guess token-level royalties for collection offers, because that would be non-canonical and could be wrong for the token that is ultimately used to fill the order.
 
 ### Fee flow diagram
 
@@ -349,13 +383,13 @@ If the listing marketplace supports royalties, they are embedded in the order's 
 Listing: 1 ETH
 
 Seller signs order with consideration:
-  → 0.995 ETH to Seller
-  → 0.005 ETH to OOB Protocol (0.5%)
+  → 0.9967 ETH to Seller
+  → 0.0033 ETH to OOB Protocol (0.33%)
 
 Buyer fills on Marketplace X (1% tip):
   → Pays 1.01 ETH total
-  → 0.995 ETH → Seller
-  → 0.005 ETH → OOB Protocol
+  → 0.9967 ETH → Seller
+  → 0.0033 ETH → OOB Protocol
   → 0.01 ETH  → Marketplace X
 ```
 

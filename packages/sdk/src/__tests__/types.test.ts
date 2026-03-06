@@ -6,8 +6,10 @@ import {
   OrderType,
   SUPPORTED_CHAINS,
   DEFAULT_API_URL,
-  DEFAULT_FEE_BPS,
-  DEFAULT_FEE_RECIPIENT,
+  DEFAULT_ORIGIN_FEE_BPS,
+  DEFAULT_ORIGIN_FEE_RECIPIENT,
+  DEFAULT_ROYALTY_POLICY,
+  MAX_ORIGIN_FEE_BPS,
   DEFAULT_LISTING_DURATION,
   DEFAULT_OFFER_DURATION,
 } from "../types.js";
@@ -47,12 +49,20 @@ describe("Constants", () => {
     expect(SUPPORTED_CHAINS[8453].nativeSymbol).toBe("ETH");
   });
 
-  it("DEFAULT_FEE_BPS is 0 (marketplace fee defaults to none)", () => {
-    expect(DEFAULT_FEE_BPS).toBe(0);
+  it("DEFAULT_ORIGIN_FEE_BPS is 0 (origin fee defaults to none)", () => {
+    expect(DEFAULT_ORIGIN_FEE_BPS).toBe(0);
   });
 
-  it("DEFAULT_FEE_RECIPIENT is empty (marketplace sets their own)", () => {
-    expect(DEFAULT_FEE_RECIPIENT).toBe("");
+  it("DEFAULT_ORIGIN_FEE_RECIPIENT is empty (originator sets their own)", () => {
+    expect(DEFAULT_ORIGIN_FEE_RECIPIENT).toBe("");
+  });
+
+  it("DEFAULT_ROYALTY_POLICY is manual_only", () => {
+    expect(DEFAULT_ROYALTY_POLICY).toBe("manual_only");
+  });
+
+  it("MAX_ORIGIN_FEE_BPS is 500 (5%)", () => {
+    expect(MAX_ORIGIN_FEE_BPS).toBe(500);
   });
 
   it("DEFAULT_LISTING_DURATION is 30 days in seconds", () => {

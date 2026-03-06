@@ -11,6 +11,7 @@ import type {
   OrdersResponse,
   SingleOrderResponse,
   SubmitOrderResponse,
+  SubmitOrderParams,
   CollectionStatsResponse,
   SeaportOrderComponents,
 } from "./types.js";
@@ -102,11 +103,13 @@ export class ApiClient {
   async submitOrder(
     order: SeaportOrderComponents,
     signature: string,
+    params?: SubmitOrderParams,
   ): Promise<SubmitOrderResponse> {
     return this.post<SubmitOrderResponse>("/v1/orders", {
       chainId: this.chainId,
       order,
       signature,
+      metadata: params?.metadata,
     });
   }
 

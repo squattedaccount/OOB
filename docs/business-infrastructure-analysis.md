@@ -28,7 +28,7 @@
 | Growth (~100k req/day) | $69 | $5 | ~$50 | $49 | **~$173** |
 | Scale (~1M req/day) | $700+ | $50+ | $280 | $199+ | **~$1,230+** |
 
-50 paying customers at $49/mo avg = $2,450 MRR vs ~$173 infra at Growth traffic. Healthy. Protocol fee (0.5% of all fills) is the larger revenue stream as volume grows.
+50 paying customers at $49/mo avg = $2,450 MRR vs ~$173 infra at Growth traffic. Healthy. Protocol fee (0.33% of all fills) is the larger revenue stream as volume grows.
 
 ---
 
@@ -95,7 +95,7 @@ When any order mutation happens (submit/cancel/fill), the API worker broadcasts 
 | **Activity history** | 30 days | 30 days | 90 days | 1 year | Full | Full |
 | **Stale detection** | Standard | Standard | Standard | Priority | Priority | Dedicated |
 | **Analytics API** | ✗ | ✗ | ✗ | ✓ | ✓ | ✓ |
-| **Protocol fee** | 0.5% | 0.5% | 0.5% | 0.4% | 0.3% | Negotiated |
+| **Protocol fee** | 0.33% | 0.33% | 0.33% | 0.28% | 0.25% | Negotiated |
 
 > Protocol fee reduction for Growth/Pro creates a direct upgrade incentive tied to trading volume — the more a customer fills, the more they save.
 

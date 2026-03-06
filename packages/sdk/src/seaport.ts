@@ -18,8 +18,9 @@ import {
   SEAPORT_ADDRESS,
   ItemType,
   OrderType,
-  DEFAULT_FEE_BPS,
-  DEFAULT_FEE_RECIPIENT,
+  DEFAULT_ORIGIN_FEE_BPS,
+  DEFAULT_ORIGIN_FEE_RECIPIENT,
+  MAX_ORIGIN_FEE_BPS,
   DEFAULT_LISTING_DURATION,
   DEFAULT_OFFER_DURATION,
   type SeaportOrderComponents,
@@ -111,20 +112,20 @@ const SEAPORT_ORDER_TYPE = {
 
 export class SeaportClient {
   private chainId: number;
-  private marketplaceFeeBps: number;
-  private marketplaceFeeRecipient: string;
+  private originFeeBps: number;
+  private originFeeRecipient: string;
 
   constructor(config: OobConfig) {
-    const feeBps = config.feeBps ?? DEFAULT_FEE_BPS;
-    if (feeBps !== 0 && (!Number.isFinite(feeBps) || !Number.isInteger(feeBps) || feeBps < 0 || feeBps > 10000)) {
-      throw new Error(`Invalid feeBps: must be an integer between 0 and 10000 (got ${feeBps})`);
+    const originFeeBps = config.originFeeBps ?? DEFAULT_ORIGIN_FEE_BPS;
+    if (originFeeBps !== 0 && (!Number.isFinite(originFeeBps) || !Number.isInteger(originFeeBps) || originFeeBps < 0 || originFeeBps > MAX_ORIGIN_FEE_BPS)) {
+      throw new Error(`Invalid originFeeBps: must be an integer between 0 and ${MAX_ORIGIN_FEE_BPS} (got ${originFeeBps})`);
     }
-    if (feeBps > 0 && !(config.feeRecipient ?? DEFAULT_FEE_RECIPIENT)) {
-      throw new Error("Invalid config: feeRecipient is required when feeBps > 0");
+    if (originFeeBps > 0 && !(config.originFeeRecipient ?? DEFAULT_ORIGIN_FEE_RECIPIENT)) {
+      throw new Error("Invalid config: originFeeRecipient is required when originFeeBps > 0");
     }
     this.chainId = config.chainId;
-    this.marketplaceFeeBps = feeBps;
-    this.marketplaceFeeRecipient = config.feeRecipient ?? DEFAULT_FEE_RECIPIENT;
+    this.originFeeBps = originFeeBps;
+    this.originFeeRecipient = config.originFeeRecipient ?? DEFAULT_ORIGIN_FEE_RECIPIENT;
   }
 
   // ─── Order Construction ─────────────────────────────────────────────────
@@ -135,7 +136,7 @@ export class SeaportClient {
    *
    * The order includes up to 3 fee consideration items:
    * 1. Protocol fee (OOB) — fetched from API, non-negotiable
-   * 2. Marketplace fee — configured by the marketplace using the SDK
+   * 2. Origin fee — configured by the marketplace/integrator using the SDK
    * 3. Royalty — optional, specified per-listing
    */
   async createListing(
@@ -159,10 +160,10 @@ export class SeaportClient {
     const royaltyBps = params.royaltyBps ?? 0;
 
     // Validate total deductions do not exceed 100%
-    const totalBps = protocolFeeBps + this.marketplaceFeeBps + royaltyBps;
+    const totalBps = protocolFeeBps + this.originFeeBps + royaltyBps;
     if (totalBps > 10000) {
       throw new Error(
-        `Total fees exceed 100%: protocolFee=${protocolFeeBps} + marketplaceFee=${this.marketplaceFeeBps} + royalty=${royaltyBps} = ${totalBps} bps`,
+        `Total fees exceed 100%: protocolFee=${protocolFeeBps} + originFee=${this.originFeeBps} + royalty=${royaltyBps} = ${totalBps} bps`,
       );
     }
 
@@ -170,12 +171,12 @@ export class SeaportClient {
       ? (priceWei * BigInt(protocolFeeBps)) / 10000n
       : 0n;
 
-    // Calculate marketplace fee (from SDK config)
-    const marketplaceFeeAmount = this.marketplaceFeeBps > 0 && this.marketplaceFeeRecipient
-      ? (priceWei * BigInt(this.marketplaceFeeBps)) / 10000n
+    // Calculate origin fee (from SDK config)
+    const originFeeAmount = this.originFeeBps > 0 && this.originFeeRecipient
+      ? (priceWei * BigInt(this.originFeeBps)) / 10000n
       : 0n;
 
-    const totalFees = protocolFeeAmount + marketplaceFeeAmount;
+    const totalFees = protocolFeeAmount + originFeeAmount;
     const sellerProceeds = priceWei - totalFees;
 
     // Build consideration items
@@ -202,15 +203,15 @@ export class SeaportClient {
       });
     }
 
-    // Add marketplace fee
-    if (marketplaceFeeAmount > 0n && this.marketplaceFeeRecipient) {
+    // Add origin fee
+    if (originFeeAmount > 0n && this.originFeeRecipient) {
       consideration.push({
         itemType: currencyItemType,
         token: currency,
         identifierOrCriteria: "0",
-        startAmount: marketplaceFeeAmount.toString(),
-        endAmount: marketplaceFeeAmount.toString(),
-        recipient: getAddress(this.marketplaceFeeRecipient),
+        startAmount: originFeeAmount.toString(),
+        endAmount: originFeeAmount.toString(),
+        recipient: getAddress(this.originFeeRecipient),
       });
     }
 
@@ -298,10 +299,10 @@ export class SeaportClient {
     const royaltyBps = params.royaltyBps ?? 0;
 
     // Validate total deductions do not exceed 100%
-    const totalBps = protocolFeeBps + this.marketplaceFeeBps + royaltyBps;
+    const totalBps = protocolFeeBps + this.originFeeBps + royaltyBps;
     if (totalBps > 10000) {
       throw new Error(
-        `Total fees exceed 100%: protocolFee=${protocolFeeBps} + marketplaceFee=${this.marketplaceFeeBps} + royalty=${royaltyBps} = ${totalBps} bps`,
+        `Total fees exceed 100%: protocolFee=${protocolFeeBps} + originFee=${this.originFeeBps} + royalty=${royaltyBps} = ${totalBps} bps`,
       );
     }
 
@@ -309,9 +310,9 @@ export class SeaportClient {
       ? (amountWei * BigInt(protocolFeeBps)) / 10000n
       : 0n;
 
-    // Calculate marketplace fee (from SDK config)
-    const marketplaceFeeAmount = this.marketplaceFeeBps > 0 && this.marketplaceFeeRecipient
-      ? (amountWei * BigInt(this.marketplaceFeeBps)) / 10000n
+    // Calculate origin fee (from SDK config)
+    const originFeeAmount = this.originFeeBps > 0 && this.originFeeRecipient
+      ? (amountWei * BigInt(this.originFeeBps)) / 10000n
       : 0n;
 
     // Determine if this is a specific token offer or collection offer
@@ -347,15 +348,15 @@ export class SeaportClient {
       });
     }
 
-    // Marketplace fee
-    if (marketplaceFeeAmount > 0n && this.marketplaceFeeRecipient) {
+    // Origin fee
+    if (originFeeAmount > 0n && this.originFeeRecipient) {
       consideration.push({
         itemType: ItemType.ERC20,
         token: currency,
         identifierOrCriteria: "0",
-        startAmount: marketplaceFeeAmount.toString(),
-        endAmount: marketplaceFeeAmount.toString(),
-        recipient: getAddress(this.marketplaceFeeRecipient),
+        startAmount: originFeeAmount.toString(),
+        endAmount: originFeeAmount.toString(),
+        recipient: getAddress(this.originFeeRecipient),
       });
     }
 

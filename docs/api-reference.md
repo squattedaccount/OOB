@@ -55,8 +55,10 @@ Query orders with filters. Returns paginated results.
       "tokenStandard": "ERC721",
       "priceWei": "1000000000000000000",
       "currency": "0x0000000000000000000000000000000000000000",
-      "feeRecipient": "0x0000000000000000000000000000000000000001",
-      "feeBps": 50,
+      "protocolFeeRecipient": "0x0000000000000000000000000000000000000001",
+      "protocolFeeBps": 33,
+      "originFeeRecipient": "0xmarketplace...addr",
+      "originFeeBps": 100,
       "royaltyRecipient": "0xartist...addr",
       "royaltyBps": 500,
       "startTime": 1707840000,
@@ -255,6 +257,8 @@ Get aggregate statistics for a collection.
 
 Submit a signed Seaport order to the order book.
 
+Optional `metadata` can be supplied to explicitly declare which embedded non-protocol payments represent `originFee` vs `royalty`. This avoids ambiguity when an order has a single extra recipient beyond the protocol fee.
+
 **Request body:**
 
 ```json
@@ -277,16 +281,16 @@ Submit a signed Seaport order to the order book.
         "itemType": 0,
         "token": "0x0000000000000000000000000000000000000000",
         "identifierOrCriteria": "0",
-        "startAmount": "995000000000000000",
-        "endAmount": "995000000000000000",
+        "startAmount": "996700000000000000",
+        "endAmount": "996700000000000000",
         "recipient": "0x1234...abcd"
       },
       {
         "itemType": 0,
         "token": "0x0000000000000000000000000000000000000000",
         "identifierOrCriteria": "0",
-        "startAmount": "5000000000000000",
-        "endAmount": "5000000000000000",
+        "startAmount": "3300000000000000",
+        "endAmount": "3300000000000000",
         "recipient": "0x0000000000000000000000000000000000000001"
       }
     ],
@@ -298,7 +302,13 @@ Submit a signed Seaport order to the order book.
     "conduitKey": "0x0000000000000000000000000000000000000000000000000000000000000000",
     "counter": "0"
   },
-  "signature": "0xsig..."
+  "signature": "0xsig...",
+  "metadata": {
+    "originFeeRecipient": "0xmarketplace...addr",
+    "originFeeBps": 100,
+    "royaltyRecipient": "0xartist...addr",
+    "royaltyBps": 500
+  }
 }
 ```
 
@@ -327,6 +337,9 @@ Submit a signed Seaport order to the order book.
 - `endTime` must be in the future
 - `offerer` must be present
 - `signature` must be a valid hex string
+- if `metadata` is supplied, it must match the actual embedded consideration amounts in the signed order
+- if an order has a single extra non-protocol fee recipient, explicit `metadata.originFee*` or `metadata.royalty*` is required so the API can classify it safely
+- `auto_eip2981` only works for token-specific orders at SDK order-creation time; collection-offer royalties must be supplied explicitly if they are to be embedded in the signed order
 
 ---
 
@@ -339,7 +352,15 @@ Submit up to 20 signed orders in one request.
 ```json
 {
   "orders": [
-    { "chainId": 8453, "order": { "...": "..." }, "signature": "0xsig..." }
+    {
+      "chainId": 8453,
+      "order": { "...": "..." },
+      "signature": "0xsig...",
+      "metadata": {
+        "royaltyRecipient": "0xartist...addr",
+        "royaltyBps": 500
+      }
+    }
   ]
 }
 ```
@@ -439,7 +460,7 @@ Get protocol fee configuration used by the API.
 
 ```json
 {
-  "protocolFeeBps": 50,
+  "protocolFeeBps": 33,
   "protocolFeeRecipient": "0x0000000000000000000000000000000000000001"
 }
 ```
@@ -555,8 +576,10 @@ Every order returned by the API has this shape:
 | `tokenStandard` | string | `ERC721` or `ERC1155` |
 | `priceWei` | string | Total price in wei (as string for precision) |
 | `currency` | string | Payment token address (`0x000...000` = native ETH) |
-| `feeRecipient` | string | Address receiving the protocol fee |
-| `feeBps` | number | Protocol fee in basis points |
+| `protocolFeeRecipient` | string | Address receiving the OOB protocol fee |
+| `protocolFeeBps` | number | OOB protocol fee in basis points |
+| `originFeeRecipient` | string \| null | Optional order originator fee recipient |
+| `originFeeBps` | number | Optional order originator fee in basis points |
 | `royaltyRecipient` | string \| null | Royalty recipient address |
 | `royaltyBps` | number | Royalty in basis points |
 | `startTime` | number | Unix timestamp when order becomes valid |

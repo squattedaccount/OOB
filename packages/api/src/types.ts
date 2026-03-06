@@ -4,7 +4,7 @@ export interface Env {
   API_ADMIN_TOKEN?: string;
   // Protocol fee enforcement (OOB takes this on every order)
   PROTOCOL_FEE_RECIPIENT: string;  // Required — OOB treasury address
-  PROTOCOL_FEE_BPS?: string;       // Protocol fee in basis points (default: 50 = 0.5%)
+  PROTOCOL_FEE_BPS?: string;       // Protocol fee in basis points (default: 33 = 0.33%)
   // Comma-separated list of valid API keys for registered rate-limit tier
   API_KEYS?: string;
   // Rate limit config (per minute)
@@ -51,10 +51,26 @@ export interface OrderIngestMessage {
   zone: string;
   startTime: number;
   endTime: number;
-  feeRecipient: string;
-  feeBps: number;
+  protocolFeeRecipient: string;
+  protocolFeeBps: number;
+  originFeeRecipient: string | null;
+  originFeeBps: number;
   royaltyRecipient: string | null;
   royaltyBps: number;
+}
+
+export interface OrderSubmissionMetadata {
+  originFeeRecipient?: string;
+  originFeeBps?: number;
+  royaltyRecipient?: string;
+  royaltyBps?: number;
+}
+
+export interface SubmitOrderBody {
+  chainId: number;
+  order: any;
+  signature: string;
+  metadata?: OrderSubmissionMetadata;
 }
 
 export interface RouteContext {

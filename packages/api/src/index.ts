@@ -239,7 +239,7 @@ async function route(
       return jsonError(503, "Protocol fee recipient is not configured");
     }
     return jsonResponse({
-      protocolFeeBps: Number(ctx.env.PROTOCOL_FEE_BPS || "50"),
+      protocolFeeBps: Number(ctx.env.PROTOCOL_FEE_BPS || "33"),
       protocolFeeRecipient: ctx.env.PROTOCOL_FEE_RECIPIENT || "",
     });
   }

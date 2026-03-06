@@ -19,8 +19,10 @@ CREATE TABLE IF NOT EXISTS seaport_orders (
     currency          TEXT NOT NULL,
 
     -- Fee details
-    fee_recipient     TEXT NOT NULL,
-    fee_bps           INTEGER NOT NULL DEFAULT 50,
+    protocol_fee_recipient TEXT NOT NULL,
+    protocol_fee_bps       INTEGER NOT NULL DEFAULT 33,
+    origin_fee_recipient   TEXT,
+    origin_fee_bps         INTEGER NOT NULL DEFAULT 0,
 
     -- Royalty (optional)
     royalty_recipient  TEXT,
