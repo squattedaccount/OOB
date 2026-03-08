@@ -2,6 +2,11 @@ export interface Env {
   DATABASE_URL: string;
   POOL_DATABASE_URL?: string; // Neon pooled endpoint (add -pooler to endpoint ID in Neon dashboard)
   API_ADMIN_TOKEN?: string;
+  SESSION_SECRET?: string;
+  SUBSCRIPTION_TREASURY_ADDRESS?: string;
+  SUBSCRIPTION_PAYMENT_TOKEN_ADDRESS?: string;
+  SUBSCRIPTION_PAYMENT_CHAIN_ID?: string;
+  SUBSCRIPTION_MIN_CONFIRMATIONS?: string;
   // Protocol fee enforcement (OOB takes this on every order)
   PROTOCOL_FEE_RECIPIENT: string;  // Required — OOB treasury address
   PROTOCOL_FEE_BPS?: string;       // Protocol fee in basis points (default: 33 = 0.33%)
@@ -36,6 +41,15 @@ export interface Env {
   RPC_URL_ABSTRACT?: string;
 }
 
+export interface RequestApiAccess {
+  identifier: string;
+  entitlements: Record<string, unknown>;
+  isRegistered: boolean;
+  apiKeyId: string | null;
+  projectId: string | null;
+  planCode: string | null;
+}
+
 export interface OrderIngestMessage {
   chainId: number;
   order: any;
@@ -44,6 +58,8 @@ export interface OrderIngestMessage {
   orderType: string;
   nftContract: string;
   tokenId: string;
+  assetScope: "token" | "collection" | "criteria";
+  identifierOrCriteria: string;
   tokenStandard: string;
   priceWei: string;
   currency: string;
@@ -53,15 +69,19 @@ export interface OrderIngestMessage {
   endTime: number;
   protocolFeeRecipient: string;
   protocolFeeBps: number;
-  originFeeRecipient: string | null;
+  originFees: OriginFee[];
   originFeeBps: number;
   royaltyRecipient: string | null;
   royaltyBps: number;
 }
 
+export interface OriginFee {
+  recipient: string;
+  bps: number;
+}
+
 export interface OrderSubmissionMetadata {
-  originFeeRecipient?: string;
-  originFeeBps?: number;
+  originFees?: OriginFee[];
   royaltyRecipient?: string;
   royaltyBps?: number;
 }
@@ -79,4 +99,5 @@ export interface RouteContext {
   url: URL;
   segments: string[];
   params: URLSearchParams;
+  access?: RequestApiAccess;
 }

@@ -5,18 +5,22 @@ import {
   handleFillTx,
   handleBatchFillTx,
   handleBestListingFillTx,
+  handleBatchSubmitOrders,
+  handleBatchCancelOrders,
 } from "../routes/orders.js";
 import type { RouteContext } from "../types.js";
 
-function makeCtx(url: string, method: string, body?: unknown): RouteContext {
+function makeCtx(url: string, method: string, body?: unknown, headers?: Record<string, string>): RouteContext {
   const request = new Request(url, {
     method,
     ...(body !== undefined
       ? {
           body: JSON.stringify(body),
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", ...(headers ?? {}) },
         }
-      : {}),
+      : headers !== undefined
+        ? { headers }
+        : {}),
   });
 
   const parsed = new URL(url);
@@ -122,5 +126,45 @@ describe("orders route validation regressions", () => {
 
     expect(res.status).toBe(400);
     expect(json.error).toContain("Invalid order hash in array");
+  });
+
+  it("caps public batch fill-tx requests more aggressively than registered ones", async () => {
+    const ctx = makeCtx("https://oob.test/v1/orders/batch/fill-tx", "POST", {
+      buyer: "0x1111111111111111111111111111111111111111",
+      orderHashes: Array.from({ length: 6 }, (_, i) => `0x${String(i + 1).padStart(64, "a")}`),
+    });
+
+    const res = await handleBatchFillTx(ctx);
+    const json = await readJson(res);
+
+    expect(res.status).toBe(400);
+    expect(json.error).toBe("Batch size exceeds maximum (2)");
+  });
+
+  it("caps public batch submit requests more aggressively than registered ones", async () => {
+    const ctx = makeCtx("https://oob.test/v1/orders/batch", "POST", {
+      orders: Array.from({ length: 6 }, () => ({ chainId: 8453, order: {}, signature: "0xdeadbeef" })),
+    });
+
+    const res = await handleBatchSubmitOrders(ctx);
+    const json = await readJson(res);
+
+    expect(res.status).toBe(400);
+    expect(json.error).toBe("Batch size exceeds maximum (2)");
+  });
+
+  it("caps public batch cancel requests more aggressively than registered ones", async () => {
+    const ctx = makeCtx("https://oob.test/v1/orders/batch", "DELETE", {
+      cancellations: Array.from({ length: 6 }, (_, i) => ({
+        orderHash: `0x${String(i + 1).padStart(64, "b")}`,
+        signature: "0xdeadbeef",
+      })),
+    });
+
+    const res = await handleBatchCancelOrders(ctx);
+    const json = await readJson(res);
+
+    expect(res.status).toBe(400);
+    expect(json.error).toBe("Batch size exceeds maximum (2)");
   });
 });

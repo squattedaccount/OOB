@@ -22,10 +22,17 @@
  *   GET    /health                       — Health check
  */
 
-import type { Env, RouteContext, OrderIngestMessage } from "./types.js";
+import type { Env, RouteContext, OrderIngestMessage, RequestApiAccess } from "./types.js";
+import { getPooledSqlClient } from "./db.js";
 import { jsonResponse, jsonError, corsPreflightResponse } from "./response.js";
 import { checkRateLimitRedis, addRateLimitHeadersRedis } from "./rateLimitRedis.js";
 import { logRequestAudit } from "./audit.js";
+import {
+  getMonthlyQuotaError,
+  getEntitlementBoolean,
+  incrementUsageCounter,
+  resolveRequestApiAccess,
+} from "./subscriptions.js";
 import {
   handleGetOrders,
   handleGetOrder,
@@ -43,8 +50,22 @@ import {
   handleErc20ApproveTx,
 } from "./routes/orders.js";
 import { handleOrderIngestQueue } from "./queue.js";
+import {
+  handleCreateAuthNonce,
+  handleVerifyAuth,
+  handleListPlans,
+  handleListProjects,
+  handleCreateProject,
+  handleListApiKeys,
+  handleCreateApiKey,
+  handleCreatePaymentQuote,
+  handleVerifyPayment,
+} from "./routes/subscriptions.js";
 
 export { OrderStreamDO } from "./stream.js";
+
+const STREAM_COLLECTION_RE = /^0x[0-9a-fA-F]{40}$/;
+const STREAM_VALID_CHAINS = new Set([1, 8453, 84532, 999, 2020, 202601, 2741]);
 
 export default {
   async queue(batch: MessageBatch<OrderIngestMessage>, env: Env): Promise<void> {
@@ -61,28 +82,41 @@ export default {
     const path = url.pathname.replace(/\/+$/, ""); // strip trailing slash
     const segments = path.split("/").filter(Boolean);
     const params = url.searchParams;
+    const access = await resolveRequestApiAccess(request, env);
 
     // WebSocket upgrade for /v1/stream
     if (segments[0] === "v1" && segments[1] === "stream") {
-      return handleStreamUpgrade(request, env, params);
+      return handleStreamUpgrade(request, env, params, access);
     }
 
     const isWrite = request.method === "POST" || request.method === "DELETE";
 
     // Audit log write operations
     if (isWrite) {
-      await logRequestAudit(request, env, url.pathname);
+      await logRequestAudit(request, env, url.pathname, access);
     }
 
     // Rate limiting
-    const rateLimitResponse = await checkRateLimitRedis(request, env, isWrite);
+    const rateLimitResponse = await checkRateLimitRedis(request, env, isWrite, access);
     if (rateLimitResponse) return rateLimitResponse;
 
-    const ctx: RouteContext = { request, env, url, segments, params };
+    if (access.projectId) {
+      const sql = getPooledSqlClient(env);
+      const quotaError = await getMonthlyQuotaError(sql, access.projectId, access.entitlements);
+      if (quotaError) {
+        return jsonError(429, quotaError);
+      }
+    }
+
+    const ctx: RouteContext = { request, env, url, segments, params, access };
 
     try {
       const response = await route(ctx, segments, request.method);
-      return addRateLimitHeadersRedis(response, request, env, isWrite);
+      const decorated = await addRateLimitHeadersRedis(response, request, env, isWrite, access);
+      if (decorated.status < 400) {
+        void recordUsage(env, access, isWrite ? "write" : "read");
+      }
+      return decorated;
     } catch (err: any) {
       console.error("[oob-api] Unhandled error:", err);
       return jsonError(500, "Internal server error");
@@ -94,14 +128,26 @@ async function handleStreamUpgrade(
   request: Request,
   env: Env,
   params: URLSearchParams,
+  access: RequestApiAccess,
 ): Promise<Response> {
   // Apply rate limiting to websocket upgrades as well.
   // Treat as write-tier to keep connection floods tightly constrained.
-  const rateLimitResponse = await checkRateLimitRedis(request, env, true);
+  const rateLimitResponse = await checkRateLimitRedis(request, env, true, access);
   if (rateLimitResponse) return rateLimitResponse;
 
   if (!env.ORDER_STREAM) {
     return jsonError(503, "WebSocket streams not configured");
+  }
+
+  if (access.projectId) {
+    const sql = getPooledSqlClient(env);
+    const quotaError = await getMonthlyQuotaError(sql, access.projectId, access.entitlements);
+    if (quotaError) {
+      return jsonError(429, quotaError);
+    }
+  }
+  if (access.isRegistered && access.projectId && !getEntitlementBoolean(access.entitlements, "websocketEnabled", false)) {
+    return jsonError(403, "WebSocket access is not enabled for this project plan");
   }
 
   const upgradeHeader = request.headers.get("Upgrade")?.toLowerCase();
@@ -110,8 +156,22 @@ async function handleStreamUpgrade(
   }
 
   // Route to a Durable Object based on chainId + collection (or "all")
-  const chainId = params.get("chainId") || "all";
-  const collection = params.get("collection")?.toLowerCase() || "all";
+  const chainIdParam = params.get("chainId");
+  const collectionParam = params.get("collection");
+
+  const chainId = chainIdParam || "all";
+  if (chainId !== "all") {
+    const numericChainId = Number(chainId);
+    if (!Number.isInteger(numericChainId) || !STREAM_VALID_CHAINS.has(numericChainId)) {
+      return jsonError(400, "Invalid chainId for stream subscription");
+    }
+  }
+
+  const collection = collectionParam?.toLowerCase() || "all";
+  if (collection !== "all" && !STREAM_COLLECTION_RE.test(collection)) {
+    return jsonError(400, "Invalid collection address for stream subscription");
+  }
+
   const roomId = `${chainId}:${collection}`;
 
   // Sharding: distribute clients across N DO instances per room.
@@ -125,8 +185,22 @@ async function handleStreamUpgrade(
   const id = env.ORDER_STREAM.idFromName(shardedRoomId);
   const stub = env.ORDER_STREAM.get(id);
 
+  if (access.isRegistered && access.projectId) {
+    void recordUsage(env, access, "websocket");
+  }
+
   // Forward the request to the Durable Object
   return stub.fetch(request);
+}
+
+async function recordUsage(env: Env, access: RequestApiAccess, kind: "read" | "write" | "websocket"): Promise<void> {
+  try {
+    if (!access.projectId) return;
+    const sql = getPooledSqlClient(env);
+    await incrementUsageCounter(sql, access.projectId, access.apiKeyId, kind);
+  } catch {
+    // Usage metering should never break request handling
+  }
 }
 
 /**
@@ -230,6 +304,46 @@ async function route(
 
   if (resource === "activity" && method === "GET") {
     return handleGetActivity(ctx);
+  }
+
+  // ─── /v1/auth ──────────────────────────────────────────────────────
+
+  if (resource === "auth") {
+    if (segments[2] === "nonce" && method === "POST") {
+      return handleCreateAuthNonce(ctx);
+    }
+    if (segments[2] === "verify" && method === "POST") {
+      return handleVerifyAuth(ctx);
+    }
+  }
+
+  // ─── /v1/projects ───────────────────────────────────────────────────
+
+  if (resource === "projects") {
+    if (!segments[2] && method === "GET") {
+      return handleListProjects(ctx);
+    }
+    if (!segments[2] && method === "POST") {
+      return handleCreateProject(ctx);
+    }
+    if (segments[2] && segments[3] === "api-keys" && method === "GET") {
+      return handleListApiKeys(ctx);
+    }
+    if (segments[2] && segments[3] === "api-keys" && method === "POST") {
+      return handleCreateApiKey(ctx);
+    }
+    if (segments[2] && segments[3] === "payment-quotes" && method === "POST") {
+      return handleCreatePaymentQuote(ctx);
+    }
+    if (segments[2] && segments[3] === "payments" && segments[4] === "verify" && method === "POST") {
+      return handleVerifyPayment(ctx);
+    }
+  }
+
+  // ─── /v1/plans ──────────────────────────────────────────────────────
+
+  if (resource === "plans" && method === "GET") {
+    return handleListPlans(ctx);
   }
 
   // ─── /v1/config ─────────────────────────────────────────────────

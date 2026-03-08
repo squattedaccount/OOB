@@ -5,8 +5,9 @@
  * KV keys auto-expire after 60 seconds.
  */
 
-import type { Env } from "./types.js";
+import type { Env, RequestApiAccess } from "./types.js";
 import { jsonError } from "./response.js";
+import { getEntitlementNumber, resolveRequestApiAccess } from "./subscriptions.js";
 
 interface RateLimitResult {
   allowed: boolean;
@@ -23,19 +24,16 @@ export async function checkRateLimit(
   request: Request,
   env: Env,
   isWrite: boolean,
+  access?: RequestApiAccess,
 ): Promise<Response | null> {
   const kv = env.OOB_RATE_LIMIT;
   if (!kv) return null; // KV not configured, skip rate limiting
 
-  const apiKey = request.headers.get("X-API-Key");
-  const isRegistered = apiKey ? isValidApiKey(apiKey, env) : false;
-
-  // Determine identifier: API key (if valid) or IP address
-  const identifier = (apiKey && isRegistered) ? apiKey : getClientIp(request);
+  const resolvedAccess = access ?? await resolveRequestApiAccess(request, env);
+  const identifier = resolvedAccess.identifier;
   if (!identifier) return null; // Can't identify client
 
-  // Determine limit based on tier and request type
-  const limit = getLimit(env, isRegistered, isWrite);
+  const limit = getLimit(env, resolvedAccess.isRegistered, isWrite, resolvedAccess.entitlements);
 
   // Build KV key with 15-second windows for tighter rate control.
   // Smaller windows reduce the impact of KV's eventual consistency race conditions.
@@ -97,16 +95,16 @@ export async function addRateLimitHeaders(
   request: Request,
   env: Env,
   isWrite: boolean,
+  access?: RequestApiAccess,
 ): Promise<Response> {
   const kv = env.OOB_RATE_LIMIT;
   if (!kv) return response;
 
-  const apiKey = request.headers.get("X-API-Key");
-  const isRegistered = apiKey ? isValidApiKey(apiKey, env) : false;
-  const identifier = (apiKey && isRegistered) ? apiKey : getClientIp(request);
+  const resolvedAccess = access ?? await resolveRequestApiAccess(request, env);
+  const identifier = resolvedAccess.identifier;
   if (!identifier) return response;
 
-  const limit = getLimit(env, isRegistered, isWrite);
+  const limit = getLimit(env, resolvedAccess.isRegistered, isWrite, resolvedAccess.entitlements);
   const window = Math.floor(Date.now() / 15000);
   const windowLimit = Math.ceil(limit / 4);
   const kind = isWrite ? "w" : "r";
@@ -124,7 +122,11 @@ export async function addRateLimitHeaders(
   return response;
 }
 
-function getLimit(env: Env, isRegistered: boolean, isWrite: boolean): number {
+function getLimit(env: Env, isRegistered: boolean, isWrite: boolean, entitlements?: Record<string, unknown>): number {
+  const entitlementLimit = isWrite
+    ? getEntitlementNumber(entitlements, "writeRpm", 0)
+    : getEntitlementNumber(entitlements, "readRpm", 0);
+  if (entitlementLimit > 0) return entitlementLimit;
   if (isRegistered) {
     return isWrite
       ? Number(env.RATE_LIMIT_REGISTERED_WRITES || 60)
@@ -133,18 +135,4 @@ function getLimit(env: Env, isRegistered: boolean, isWrite: boolean): number {
   return isWrite
     ? Number(env.RATE_LIMIT_PUBLIC_WRITES || 10)
     : Number(env.RATE_LIMIT_PUBLIC_READS || 60);
-}
-
-function isValidApiKey(key: string, env: Env): boolean {
-  if (!env.API_KEYS) return false;
-  const validKeys = env.API_KEYS.split(",").map((k) => k.trim()).filter(Boolean);
-  return validKeys.includes(key);
-}
-
-function getClientIp(request: Request): string {
-  return (
-    request.headers.get("CF-Connecting-IP") ||
-    request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ||
-    "unknown"
-  );
 }

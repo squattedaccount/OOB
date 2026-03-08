@@ -213,6 +213,28 @@ export class RedisCache {
   }
 
   /**
+   * Clear an order deduplication key.
+   * Used when a submission reserved a dedup slot but failed before durable persistence.
+   */
+  async clearDedup(orderHash: string): Promise<void> {
+    try {
+      const key = `${NS}:dedup:${orderHash}`;
+      const response = await fetch(`${this.baseUrl}/del/${encodeURIComponent(key)}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+        },
+      });
+
+      if (!response.ok) {
+        console.warn(`[cache] Deduplication DEL failed for ${orderHash}: ${response.status}`);
+      }
+    } catch (err) {
+      console.error(`[cache] Deduplication clear error for ${orderHash}:`, err);
+    }
+  }
+
+  /**
    * Check if an order hash is in the deduplication set.
    */
   async isDuplicate(orderHash: string): Promise<boolean> {

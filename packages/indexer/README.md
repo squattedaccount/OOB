@@ -2,6 +2,8 @@
 
 Standalone Cloudflare Worker that monitors Seaport v1.6 on-chain events and manages order lifecycle in the OOB database.
 
+If you are new to the project, start with [../../docs/start-here.md](../../docs/start-here.md). This document focuses on indexer setup, webhook ingestion, and production operations.
+
 ## What It Does
 
 1. **Webhook receiver** — accepts on-chain log events from Alchemy, Moralis, or Goldsky
@@ -22,7 +24,6 @@ Standalone Cloudflare Worker that monitors Seaport v1.6 on-chain events and mana
 ## Setup
 
 ```bash
-cd packages/indexer
 npm install
 
 # Set secrets
@@ -38,6 +39,14 @@ wrangler secret put RPC_URL_ABSTRACT  # Abstract (2741)
 wrangler deploy
 ```
 
+Recommended order for first-time setup:
+
+1. Deploy and migrate the API worker first.
+2. Point the indexer at the same Postgres database.
+3. Configure webhook secrets and chain RPC URLs.
+4. Deploy the indexer.
+5. Register webhook endpoints with Alchemy, Moralis, or Goldsky.
+
 ## Endpoints
 
 | Method | Path | Description |
@@ -48,6 +57,8 @@ wrangler deploy
 | `POST` | `/webhook/goldsky` | Goldsky Mirror webhook |
 | `GET` | `/health` | Health check |
 | `GET` | `/status` | Order counts by status |
+
+See [../../docs/architecture.md](../../docs/architecture.md) for the system-level flow and [../../packages/api/README.md](../../packages/api/README.md) for the API worker setup that the indexer depends on.
 
 ## Goldsky Pipeline Sync
 

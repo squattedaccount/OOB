@@ -2,7 +2,7 @@
 
 Open-source NFT order book protocol built on [Seaport](https://github.com/ProjectOpenSea/seaport).
 
-**No gatekeepers. No API keys required. No vendor lock-in.**
+**Open liquidity. Public reads. Optional higher-throughput access via project API keys. No vendor lock-in.**
 
 Any marketplace, bot, or AI agent can read and write orders through a single shared book.
 
@@ -53,28 +53,46 @@ npm run build
 npm run test
 ```
 
-## SDK Usage
+For a guided onboarding flow, start with [docs/start-here.md](docs/start-here.md).
+
+## Start Here
+
+- **[New integrator]** Start with [docs/start-here.md](docs/start-here.md), then read [docs/integration-guide.md](docs/integration-guide.md) and [docs/api-reference.md](docs/api-reference.md).
+- **[Self-hoster / infra owner]** Start with [docs/start-here.md](docs/start-here.md), then read [docs/architecture.md](docs/architecture.md) and [packages/api/README.md](packages/api/README.md).
+- **[SDK consumer]** Go to [packages/sdk/README.md](packages/sdk/README.md).
+- **[API operator]** Go to [packages/api/README.md](packages/api/README.md).
+
+## Current Access Model
+
+- **Public reads** remain open with no API key required.
+- **Writes** remain available without registration, but are rate-limited.
+- **DB-backed project API keys** now support higher-throughput access, entitlement-based limits, monthly quotas, and WebSocket plan gating.
+- **Legacy `API_KEYS`** still work as a migration fallback for registered-tier rate limits, but they do not carry project subscription state.
+
+For subscription setup, wallet auth, and production env configuration, see `packages/api/README.md`.
+
+## SDK Example
 
 ```typescript
 import { OpenOrderBook } from '@oob/sdk';
 
 const oob = new OpenOrderBook({
-  apiUrl: 'https://oob-api.sm-p.workers.dev',
-  chainId: 1,
+  apiUrl: 'https://api.openorderbook.xyz',
+  chainId: 8453,
 });
 
 // Get listings for a collection
 const { orders } = await oob.getListings({
-  collection: '0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D',
+  collection: '0xYourCollectionAddress',
 });
 
 // Get floor price
 const floor = await oob.getBestListing({
-  collection: '0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D',
+  collection: '0xYourCollectionAddress',
 });
 ```
 
-## API Endpoints
+## API Surface
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -95,9 +113,12 @@ const floor = await oob.getBestListing({
 
 ## Documentation
 
+- [Start Here](docs/start-here.md)
 - [API Reference](docs/api-reference.md)
 - [Integration Guide](docs/integration-guide.md)
 - [Architecture & Self-Hosting](docs/architecture.md)
+- [API Worker Setup & Subscription Rollout](packages/api/README.md)
+- [Indexer Setup & Operations](packages/indexer/README.md)
 
 ## Contributing
 

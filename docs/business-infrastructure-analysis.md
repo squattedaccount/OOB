@@ -128,14 +128,21 @@ When any order mutation happens (submit/cancel/fill), the API worker broadcasts 
 
 ## 6. Infrastructure Prerequisites for Any Paid Tier
 
-Before you can enforce per-key limits, you need:
+The core subscription foundation is now in place:
 
-1. **DB-backed API key store** — replace the `API_KEYS` env var with an `api_keys` table: `(key_hash, tier, owner_email, created_at)`. This is the foundation for everything else.
-2. **`api_key_collections` table** — `(key_hash, nft_contract, chain_id, added_at)`. Checked on every order submit.
-3. **`api_key_ws_connections` tracking** — count active WS connections per key in Redis (lightweight `INCR`/`DECR` on connect/disconnect).
-4. **Upgrade Neon to Launch ($19/mo)** — eliminates auto-suspend cold starts.
-5. **Upgrade Upstash to PAYG** — free tier breaks at ~2–5k API req/day.
-6. **Cloudflare Workers Paid ($5/mo)** — needed for 30ms CPU budget on write paths.
+1. **DB-backed accounts, projects, plans, subscriptions, payments, and API keys** — implemented in the API worker schema.
+2. **Wallet-based auth and session tokens** — implemented for dashboard/subscription routes.
+3. **Entitlement-driven rate limiting and batch-size gating** — implemented for DB-backed project access.
+4. **Monthly quota enforcement** — implemented for DB-backed project access.
+5. **WebSocket entitlement gating** — implemented for DB-backed project access.
+
+Still recommended as future operational work:
+
+1. **Per-project websocket connection accounting** — not yet implemented; current websocket gating focuses on plan enablement rather than concurrent connection quotas.
+2. **Collection-level write entitlements** — not yet implemented.
+3. **Upgrade Neon to Launch ($19/mo)** — still recommended to avoid auto-suspend cold starts.
+4. **Upgrade Upstash to PAYG** — still recommended once request volume outgrows the free tier.
+5. **Cloudflare Workers Paid ($5/mo)** — still recommended for comfortable write-path CPU headroom.
 
 ---
 
@@ -145,7 +152,7 @@ Before you can enforce per-key limits, you need:
 
 2. **Collection limit scope:** Per-chain or global? (Recommendation above: global.)
 
-3. **Existing keys:** The current `API_KEYS` env var entries — what tier do they get when migrated to DB? Recommend Pro/unlimited so existing integrations don't break.
+3. **Existing keys:** Legacy `API_KEYS` still work today as a migration fallback. A future cutover decision is whether to eventually retire them or bulk-migrate important integrators into DB-backed projects.
 
 4. **Marketplaces vs agents:** Same tier system for both, or separate tracks with different feature emphasis? Argument for same: simpler. Argument for separate: a marketplace cares about collection allowlist + analytics; an agent cares about rate limits + batch size + WebSocket scale.
 

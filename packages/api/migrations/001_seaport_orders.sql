@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS seaport_orders (
     -- Fee details
     protocol_fee_recipient TEXT NOT NULL,
     protocol_fee_bps       INTEGER NOT NULL DEFAULT 33,
-    origin_fee_recipient   TEXT,
+    origin_fees_json       JSONB NOT NULL DEFAULT '[]'::jsonb,
     origin_fee_bps         INTEGER NOT NULL DEFAULT 0,
 
     -- Royalty (optional)

@@ -18,7 +18,7 @@ This guide walks through common integration scenarios for the Open Order Book. P
 
 ## For NFT Traders
 
-You don't need to be technical to benefit from the Open Order Book. Here's what it means for you:
+You do not need to be technical to benefit from the Open Order Book. Here is what it means for you:
 
 ### What happens when you list on a connected marketplace
 
@@ -51,6 +51,8 @@ If your listed NFT moves out of your wallet, the indexer marks that listing as `
 ## For Marketplace Builders
 
 The Open Order Book gives you instant liquidity. Instead of starting with an empty order book, you launch with every order from every connected marketplace.
+
+**Access note:** public reads work without a key. If you need higher sustained throughput, larger batch limits, or plan-gated websocket access, use a DB-backed project API key from the subscription/dashboard flow.
 
 ### Step 1: Display orders (read-only)
 
@@ -188,7 +190,7 @@ const result = await oob.createOffer({
 
 ## For Trading Bots
 
-The Open Order Book is designed for bot access. No API keys needed for reads, minimal friction for writes.
+The Open Order Book is designed for bot access. No API keys are needed for public reads, and writes stay available without registration, but higher-throughput automation is better served by a project API key.
 
 ### Simple floor sweeper (TypeScript)
 
@@ -286,16 +288,18 @@ done
 | Tier | Reads/min | Writes/min | How to get |
 |---|---|---|---|
 | Public | 60 | 10 | Default, no key needed |
-| Registered | 300 | 60 | Free API key — request at openorderbook.xyz |
-| Premium | 1000+ | 200+ | Contact us |
+| Legacy registered | 300 | 60 | Legacy `API_KEYS` fallback |
+| Project key | Plan-defined | Plan-defined | Create a project and API key via wallet auth + subscription flow |
 
-For high-frequency bots, we recommend using WebSocket instead of polling to stay within rate limits and get faster updates.
+For high-frequency bots, we recommend using WebSocket instead of polling to stay within rate limits and get faster updates. For DB-backed projects, websocket access and batch size are plan-controlled entitlements and monthly project quotas may also apply.
 
 ---
 
 ## For AI Agents
 
 AI agents (LangChain, AutoGPT, custom agents) can interact with the Open Order Book via the REST API.
+
+For heavier agent traffic, provision a project API key instead of relying only on public IP-based limits.
 
 ### Tool definition for LangChain / function calling
 

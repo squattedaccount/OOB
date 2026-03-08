@@ -47,10 +47,12 @@ verification, so CORS is not the security boundary. Options:
   - Recommendation: **keep `*` for now** since this is a public protocol API. The real auth is API keys + EIP-712 signatures.
 
 ### DB Connection Pooling
-Neon's `fetchConnectionCache = true` is already the recommended approach for Cloudflare Workers
-(HTTP-based, no persistent TCP). For higher throughput:
-  - Enable Neon's **connection pooler** (PgBouncer) in the Neon dashboard and use the pooled connection string.
-  - No code changes needed — just swap `DATABASE_URL` to the pooled endpoint.
+Neon's old `fetchConnectionCache` guidance is no longer relevant here.
+
+Current approach:
+  - Use `DATABASE_URL` for migrations and direct admin connectivity.
+  - Use `POOL_DATABASE_URL` for API request traffic when Neon pooler (PgBouncer) is enabled.
+  - The API worker already prefers `POOL_DATABASE_URL` when it is configured.
 
 ### Monitoring / Alerting
 Recommended stack for Cloudflare Workers:

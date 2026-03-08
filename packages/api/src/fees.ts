@@ -1,7 +1,8 @@
-import type { OrderSubmissionMetadata } from "./types.js";
+import type { OrderSubmissionMetadata, OriginFee } from "./types.js";
 
 const ETH_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const MAX_ORIGIN_FEE_BPS = 500;
+const MAX_ORIGIN_FEE_RECIPIENTS = 5;
 
 function isValidAddress(addr: string): boolean {
   return ETH_ADDRESS_RE.test(addr);
@@ -26,18 +27,31 @@ function normalizeMetadata(
   if (!metadata) return { ok: true, metadata: {} };
 
   const normalized: OrderSubmissionMetadata = {};
-  const originFeeBps = metadata.originFeeBps ?? 0;
   const royaltyBps = metadata.royaltyBps ?? 0;
 
-  if (originFeeBps > 0) {
-    if (!metadata.originFeeRecipient || !isValidAddress(metadata.originFeeRecipient)) {
-      return { ok: false, error: "metadata.originFeeRecipient is required when metadata.originFeeBps > 0" };
+  if (metadata.originFees && metadata.originFees.length > 0) {
+    if (metadata.originFees.length > MAX_ORIGIN_FEE_RECIPIENTS) {
+      return { ok: false, error: `metadata.originFees supports at most ${MAX_ORIGIN_FEE_RECIPIENTS} recipients` };
     }
-    if (!Number.isInteger(originFeeBps) || originFeeBps < 0 || originFeeBps > MAX_ORIGIN_FEE_BPS) {
-      return { ok: false, error: `metadata.originFeeBps must be an integer between 0 and ${MAX_ORIGIN_FEE_BPS}` };
+
+    let totalOriginFeeBps = 0;
+    const normalizedOriginFees: OriginFee[] = [];
+    for (const originFee of metadata.originFees) {
+      if (!originFee?.recipient || !isValidAddress(originFee.recipient)) {
+        return { ok: false, error: "metadata.originFees[].recipient must be a valid address" };
+      }
+      if (!Number.isInteger(originFee.bps) || originFee.bps <= 0 || originFee.bps > MAX_ORIGIN_FEE_BPS) {
+        return { ok: false, error: `metadata.originFees[].bps must be an integer between 1 and ${MAX_ORIGIN_FEE_BPS}` };
+      }
+      totalOriginFeeBps += originFee.bps;
+      normalizedOriginFees.push({ recipient: originFee.recipient.toLowerCase(), bps: originFee.bps });
     }
-    normalized.originFeeBps = originFeeBps;
-    normalized.originFeeRecipient = metadata.originFeeRecipient.toLowerCase();
+
+    if (totalOriginFeeBps > MAX_ORIGIN_FEE_BPS) {
+      return { ok: false, error: `metadata.originFees total must not exceed ${MAX_ORIGIN_FEE_BPS} bps` };
+    }
+
+    normalized.originFees = normalizedOriginFees;
   }
 
   if (royaltyBps > 0) {
@@ -51,12 +65,8 @@ function normalizeMetadata(
     normalized.royaltyRecipient = metadata.royaltyRecipient.toLowerCase();
   }
 
-  if (
-    normalized.originFeeRecipient &&
-    normalized.royaltyRecipient &&
-    normalized.originFeeRecipient === normalized.royaltyRecipient
-  ) {
-    return { ok: false, error: "metadata.originFeeRecipient and metadata.royaltyRecipient must be different when both are set" };
+  if (normalized.royaltyRecipient && normalized.originFees?.some((originFee) => originFee.recipient === normalized.royaltyRecipient)) {
+    return { ok: false, error: "metadata.originFees recipients and metadata.royaltyRecipient must be different when both are set" };
   }
 
   return { ok: true, metadata: normalized };
@@ -66,12 +76,14 @@ export interface ParsedOrderDetails {
   orderType: "listing" | "offer";
   nftContract: string;
   tokenId: string;
+  assetScope: "token" | "collection" | "criteria";
+  identifierOrCriteria: string;
   tokenStandard: string;
   priceWei: bigint;
   currency: string;
   protocolFeeRecipient: string;
   protocolFeeBps: number;
-  originFeeRecipient: string;
+  originFees: OriginFee[];
   originFeeBps: number;
   royaltyRecipient: string;
   royaltyBps: number;
@@ -94,6 +106,8 @@ export function parseOrderDetails(
   let orderType: "listing" | "offer";
   let nftContract: string;
   let tokenId: string;
+  let assetScope: "token" | "collection" | "criteria";
+  let identifierOrCriteria: string;
   let tokenStandard: string;
   let priceWei: bigint;
   let currency: string;
@@ -101,14 +115,35 @@ export function parseOrderDetails(
   let protocolFeeRecipientParsed = "";
   const extraRecipientAmounts = new Map<string, bigint>();
 
-  const nftInOffer = offerItems.find((i: any) => Number(i.itemType) === 2 || Number(i.itemType) === 3);
-  const nftInConsideration = considerationItems.find((i: any) => Number(i.itemType) === 2 || Number(i.itemType) === 3);
+  const nftInOffer = offerItems.find((i: any) => [2, 3, 4, 5].includes(Number(i.itemType)));
+  const nftInConsideration = considerationItems.find((i: any) => [2, 3, 4, 5].includes(Number(i.itemType)));
+
+  const resolveAssetScope = (itemType: number, identifierRaw: any) => {
+    const identifier = String(identifierRaw || "0");
+    if (itemType === 2 || itemType === 3) {
+      return {
+        assetScope: "token" as const,
+        tokenId: identifier,
+        identifierOrCriteria: identifier,
+        tokenStandard: itemType === 2 ? "ERC721" : "ERC1155",
+      };
+    }
+
+    return {
+      assetScope: identifier === "0" ? "collection" as const : "criteria" as const,
+      tokenId: "0",
+      identifierOrCriteria: identifier,
+      tokenStandard: itemType === 4 ? "ERC721" : "ERC1155",
+    };
+  };
 
   if (nftInOffer) {
     orderType = "listing";
     nftContract = (nftInOffer.token || "").toLowerCase();
-    tokenId = String(nftInOffer.identifierOrCriteria || "0");
-    tokenStandard = Number(nftInOffer.itemType) === 2 ? "ERC721" : "ERC1155";
+    ({ tokenId, assetScope, identifierOrCriteria, tokenStandard } = resolveAssetScope(
+      Number(nftInOffer.itemType),
+      nftInOffer.identifierOrCriteria,
+    ));
     priceWei = 0n;
     currency = "0x0000000000000000000000000000000000000000";
 
@@ -132,8 +167,10 @@ export function parseOrderDetails(
   } else if (nftInConsideration) {
     orderType = "offer";
     nftContract = (nftInConsideration.token || "").toLowerCase();
-    tokenId = String(nftInConsideration.identifierOrCriteria || "0");
-    tokenStandard = Number(nftInConsideration.itemType) === 2 ? "ERC721" : "ERC1155";
+    ({ tokenId, assetScope, identifierOrCriteria, tokenStandard } = resolveAssetScope(
+      Number(nftInConsideration.itemType),
+      nftInConsideration.identifierOrCriteria,
+    ));
     priceWei = 0n;
     currency = "0x0000000000000000000000000000000000000000";
     for (const item of offerItems) {
@@ -168,73 +205,61 @@ export function parseOrderDetails(
   }
 
   const protocolFeeBps = computeBps(protocolFeeAmount, priceWei);
-  let originFeeRecipient = "";
+  const originFees: OriginFee[] = [];
   let originFeeAmount = 0n;
   let royaltyRecipient = "";
   let royaltyAmount = 0n;
+  if (normalizedMetadata.metadata.originFees) {
+    for (const declaredOriginFee of normalizedMetadata.metadata.originFees) {
+      const amount = extraRecipientAmounts.get(declaredOriginFee.recipient) ?? 0n;
+      if (amount <= 0n) {
+        return { ok: false, error: "Order metadata declares origin fee, but no matching consideration recipient was found" };
+      }
+      const actualBps = computeBps(amount, priceWei);
+      if (actualBps !== declaredOriginFee.bps) {
+        return { ok: false, error: `Order metadata origin fee mismatch for ${declaredOriginFee.recipient}: expected ${declaredOriginFee.bps} bps, found ${actualBps} bps` };
+      }
+      extraRecipientAmounts.delete(declaredOriginFee.recipient);
+      originFees.push(declaredOriginFee);
+      originFeeAmount += amount;
+    }
+  }
 
-  const consumeRecipient = (recipient: string | undefined, expectedBps: number | undefined, label: "origin fee" | "royalty"):
-    { ok: true } | { ok: false; error: string } => {
-    if (!recipient || !expectedBps) return { ok: true };
-    const amount = extraRecipientAmounts.get(recipient) ?? 0n;
+  if (normalizedMetadata.metadata.royaltyRecipient && normalizedMetadata.metadata.royaltyBps) {
+    const amount = extraRecipientAmounts.get(normalizedMetadata.metadata.royaltyRecipient) ?? 0n;
     if (amount <= 0n) {
-      return { ok: false, error: `Order metadata declares ${label}, but no matching consideration recipient was found` };
+      return { ok: false, error: "Order metadata declares royalty, but no matching consideration recipient was found" };
     }
     const actualBps = computeBps(amount, priceWei);
-    if (actualBps !== expectedBps) {
-      return { ok: false, error: `Order metadata ${label} mismatch: expected ${expectedBps} bps, found ${actualBps} bps` };
+    if (actualBps !== normalizedMetadata.metadata.royaltyBps) {
+      return { ok: false, error: `Order metadata royalty mismatch: expected ${normalizedMetadata.metadata.royaltyBps} bps, found ${actualBps} bps` };
     }
-    extraRecipientAmounts.delete(recipient);
-    if (label === "origin fee") {
-      originFeeRecipient = recipient;
-      originFeeAmount = amount;
-    } else {
-      royaltyRecipient = recipient;
-      royaltyAmount = amount;
-    }
-    return { ok: true };
-  };
-
-  const metadataResultOrigin = consumeRecipient(
-    normalizedMetadata.metadata.originFeeRecipient,
-    normalizedMetadata.metadata.originFeeBps,
-    "origin fee",
-  );
-  if (!metadataResultOrigin.ok) return metadataResultOrigin;
-
-  const metadataResultRoyalty = consumeRecipient(
-    normalizedMetadata.metadata.royaltyRecipient,
-    normalizedMetadata.metadata.royaltyBps,
-    "royalty",
-  );
-  if (!metadataResultRoyalty.ok) return metadataResultRoyalty;
+    extraRecipientAmounts.delete(normalizedMetadata.metadata.royaltyRecipient);
+    royaltyRecipient = normalizedMetadata.metadata.royaltyRecipient;
+    royaltyAmount = amount;
+  }
 
   const remainingRecipients = Array.from(extraRecipientAmounts.entries());
   const hasExplicitMetadata = Boolean(
-    normalizedMetadata.metadata.originFeeRecipient ||
+    normalizedMetadata.metadata.originFees?.length ||
     normalizedMetadata.metadata.royaltyRecipient,
   );
 
-  if (remainingRecipients.length > 2) {
+  if (remainingRecipients.length > 1) {
     return {
       ok: false,
-      error: "Orders with more than two non-protocol fee recipients are not supported yet; submit fewer recipients or wait for multi-recipient support",
+      error: "Orders with unclassified extra fee recipients are not supported; submit explicit metadata for all origin fee recipients and royalty",
     };
   }
 
   if (remainingRecipients.length === 1 && !hasExplicitMetadata) {
     return {
       ok: false,
-      error: "Ambiguous extra fee recipient: submit metadata.originFee* or metadata.royalty* so the order can be classified safely",
+      error: "Ambiguous extra fee recipient: submit metadata.originFees or metadata.royalty* so the order can be classified safely",
     };
   }
 
   for (const [recipient, amount] of remainingRecipients) {
-    if (!originFeeRecipient) {
-      originFeeRecipient = recipient;
-      originFeeAmount = amount;
-      continue;
-    }
     if (!royaltyRecipient) {
       royaltyRecipient = recipient;
       royaltyAmount = amount;
@@ -253,12 +278,14 @@ export function parseOrderDetails(
       orderType,
       nftContract,
       tokenId,
+      assetScope,
+      identifierOrCriteria,
       tokenStandard,
       priceWei,
       currency,
       protocolFeeRecipient: protocolFeeRecipientParsed,
       protocolFeeBps,
-      originFeeRecipient,
+      originFees,
       originFeeBps,
       royaltyRecipient,
       royaltyBps,

@@ -13,26 +13,25 @@ npm install
 ## Project Structure
 
 ```
-oob-sdk/          ← You are here (SDK + docs)
-├── src/           ← SDK source code
-│   ├── index.ts   ← Public exports
-│   ├── types.ts   ← Types and constants
-│   ├── api.ts     ← REST API client
-│   ├── seaport.ts ← Seaport contract interactions
-│   └── client.ts  ← Main OpenOrderBook class
-├── docs/          ← Documentation
-│   ├── api-reference.md
-│   ├── integration-guide.md
-│   └── architecture.md
-└── dist/          ← Built output (git-ignored)
+packages/
+├── sdk/           ← TypeScript SDK
+│   ├── src/
+│   └── README.md
+├── api/           ← Cloudflare Worker API
+│   ├── src/
+│   ├── migrations/
+│   ├── scripts/
+│   ├── README.md
+│   └── wrangler.toml
+└── indexer/       ← Cloudflare Worker indexer
+    ├── src/
+    └── README.md
 
-oob-api/           ← API worker (separate directory)
-├── src/
-│   ├── index.ts   ← Router
-│   ├── routes/    ← Route handlers
-│   ├── db.ts      ← Database client
-│   └── response.ts← Response helpers
-└── wrangler.toml  ← Cloudflare config
+docs/
+├── api-reference.md
+├── integration-guide.md
+├── architecture.md
+└── business-infrastructure-analysis.md
 ```
 
 ## Development
@@ -40,7 +39,7 @@ oob-api/           ← API worker (separate directory)
 ### SDK
 
 ```bash
-cd oob-sdk
+cd packages/sdk
 npm run check    # Type check (no emit)
 npm run build    # Build ESM + CJS + declarations
 npm run dev      # Watch mode
@@ -50,9 +49,18 @@ npm run test     # Run tests
 ### API Worker
 
 ```bash
-cd oob-api
+cd packages/api
 npm run check    # Type check
 npm run dev      # Local dev server (wrangler)
+npm run test     # Run tests
+```
+
+### Indexer
+
+```bash
+cd packages/indexer
+npm run check
+npm run dev
 ```
 
 ## Guidelines

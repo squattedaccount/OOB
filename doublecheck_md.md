@@ -20,10 +20,14 @@ CORS note:
 
 ## 5) API key usage clarification (for follow-up)
 
-`X-API-Key` in this project is used for rate-limit tiering, not auth.
+`X-API-Key` now has two roles in the project:
+
+- legacy `API_KEYS` still act as rate-limit tiering / migration fallback
+- DB-backed project API keys resolve to project subscription entitlements stored in Postgres
 
 Code signals:
 - Header read + key validation for tiering: `packages/api/src/rateLimit.ts`
+- DB-backed access resolution: `packages/api/src/subscriptions.ts`
 - CORS allows `X-API-Key`: `packages/api/src/response.ts`
 - Write authorization still comes from signatures: `packages/api/src/routes/orders.ts`
 
@@ -112,7 +116,7 @@ There is no DB tracking at all. When agent A connects and says "watch collection
 
 What else agents can use WebSocket for: real-time floor price monitoring without polling, arbitrage signals (new cheap listing → instant notification), watching counter-offers on collections they're market-making in, live UI feeds for marketplace frontends.
 
-The current gap: the 100-collection limit is per-connection, not per-key. An agent can open 10 connections × 100 collections = 1,000 collections watched with no restriction. The tier system closes this with a total collections watched across all connections per key limit. "
+The current gap: the 100-collection limit is per-connection, not per-key. An agent can open 10 connections × 100 collections = 1,000 collections watched with no restriction. The current implementation does gate websocket access by project entitlement and monthly quota, but it does not yet enforce total concurrent websocket or total watched-collection quotas across connections. "
 
 as i understand it, it works only when an user is tracking our events... whilte they do it, he can get real time info... but in my head, this should be like a service where agetn can subscirbe to a collection, and get notificaton everytime when something happens in the collection, like new NFT listed, etc. also we should figure it out tier limits, and API tiers, and consider this to add as some paid feature. 
 

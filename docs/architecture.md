@@ -72,7 +72,7 @@ The SDK is a convenience wrapper around the API. Everything the SDK does can be 
 
 ## Components
 
-### OOB API (`oob-api/`)
+### OOB API (`packages/api/`)
 
 A Cloudflare Worker that serves the public REST API.
 
@@ -103,7 +103,7 @@ A Cloudflare Worker that serves the public REST API.
 | WSS | `/v1/stream` | Real-time event stream |
 | GET | `/health` | Health check |
 
-### OOB SDK (`oob-sdk/`)
+### OOB SDK (`packages/sdk/`)
 
 TypeScript/JavaScript SDK for interacting with the API and Seaport contracts.
 
@@ -240,7 +240,14 @@ This separation is critical for:
 
 ## Database Schema
 
-Single table: `seaport_orders`
+The project now has two main data domains:
+
+1. **Order book data** — orders, activity, dedup state, stale-check state
+2. **API access + subscriptions data** — accounts, wallets, projects, plans, subscriptions, payments, API keys, usage counters, auth nonces
+
+### Order book tables
+
+The core trading path is still centered on `seaport_orders`.
 
 ```sql
 CREATE TABLE seaport_orders (
@@ -260,8 +267,10 @@ CREATE TABLE seaport_orders (
     currency          TEXT NOT NULL,
 
     -- Fee details
-    fee_recipient     TEXT NOT NULL,
-    fee_bps           INTEGER NOT NULL DEFAULT 50,
+    protocol_fee_recipient TEXT NOT NULL,
+    protocol_fee_bps       INTEGER NOT NULL DEFAULT 33,
+    origin_fees_json       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    origin_fee_bps         INTEGER NOT NULL DEFAULT 0,
 
     -- Royalty (optional)
     royalty_recipient  TEXT,
@@ -297,6 +306,23 @@ CREATE INDEX idx_seaport_orders_expiry ON seaport_orders (end_time) WHERE status
 - `order_json` is `JSONB` — allows querying into the Seaport order structure if needed
 - Partial index on `end_time` for active orders — fast expiry checks
 - Composite indexes match the most common query patterns (collection + status, token + status)
+
+### API subscription tables
+
+The subscription rollout adds durable API access state in Postgres. The key tables are:
+
+- `api_accounts`
+- `api_account_wallets`
+- `api_projects`
+- `api_plans`
+- `api_project_subscriptions`
+- `api_payment_quotes`
+- `api_payments`
+- `api_keys`
+- `api_usage_counters`
+- `api_auth_nonces`
+
+This lets the worker resolve a request into a project-scoped access object once per request and then reuse that for rate limiting, quota checks, audit logging, websocket gating, and usage metering.
 
 ---
 
@@ -359,15 +385,16 @@ When an order is submitted via `POST /v1/orders`, the API validates:
 2. **Structure** — must contain an NFT in `offer` (listing) or `consideration` (offer)
 3. **Expiry** — `endTime` must be in the future
 4. **Offerer** — must be present
-5. **Deduplication** — order hash must not already exist
+5. **Signature validity** — EIP-712 signature must recover the order offerer
+6. **Fee enforcement** — the required protocol fee recipient and minimum fee bps must be present
+7. **Deduplication** — order hash must not already exist
 
 **Not validated at submission time** (validated by Seaport at fill time):
-- Signature validity (Seaport verifies on-chain)
 - NFT ownership (checked on-chain)
 - Seaport approval (checked on-chain)
 - Sufficient balance (checked on-chain)
 
-This is intentional — the API is a **relay**, not a validator. Invalid orders will simply fail when someone tries to fill them, and the indexer will mark them as stale.
+This is intentional — the API performs lightweight admission checks, but it is not a full execution simulator. Orders can still fail later if on-chain ownership, approvals, balances, or other fill-time conditions change.
 
 ---
 
@@ -413,6 +440,12 @@ Each collection gets its own Durable Object instance that:
 3. When a new order is submitted (POST /v1/orders), the API notifies the relevant Durable Object
 4. The Durable Object broadcasts the event to all connected clients
 
+For DB-backed project keys, websocket upgrades are additionally checked against:
+
+- plan entitlement `websocketEnabled`
+- monthly request quota state
+- standard request rate limiting
+
 ### Why Durable Objects?
 
 - **No separate WebSocket server** — runs on the same Cloudflare infrastructure
@@ -434,28 +467,31 @@ Each collection gets its own Durable Object instance that:
 
 ## Rate Limiting
 
-Rate limiting is implemented using Cloudflare KV (key-value store) for distributed counting.
+Rate limiting is implemented with **Upstash Redis when configured**, with **Cloudflare KV fallback** when Redis is not configured.
 
 ### How it works
 
 1. Each request is identified by IP address (public) or API key (registered)
-2. A counter in KV tracks requests per minute
-3. If the counter exceeds the limit, return `429 Too Many Requests`
-4. Counters expire automatically after 60 seconds
+2. A request-scoped access object is resolved from the incoming request
+3. Entitlements are loaded from the active DB-backed project plan when applicable
+4. A distributed counter in Redis or KV tracks requests per minute
+5. DB-backed projects can also be blocked by monthly quota exhaustion
+6. Successful DB-backed project traffic increments usage counters in Postgres
+7. If limits are exceeded, the API returns `429 Too Many Requests`
 
 ### Tiers
 
 | Tier | Reads/min | Writes/min | Identification |
 |---|---|---|---|
 | Public | 60 | 10 | IP address |
-| Registered | 300 | 60 | `X-API-Key` header |
-| Premium | 1000+ | 200+ | `X-API-Key` header |
+| Legacy registered | 300 | 60 | `X-API-Key` header |
+| Project key | Plan-defined | Plan-defined | `X-API-Key` header |
 
 ### Why these limits?
 
 - **Public 60/min** — enough for a dashboard refreshing every second, too slow for aggressive bots (encourages WebSocket)
-- **Registered 300/min** — enough for a marketplace with moderate traffic
-- **Premium 1000+/min** — for high-frequency trading bots and large marketplaces
+- **Legacy registered 300/min** — preserves older integrations during migration
+- **Project plans** — allow DB-backed entitlements like higher RPM, larger batch size, websocket access, and monthly quota enforcement
 
 ---
 
@@ -524,6 +560,13 @@ This applies all SQL files in `packages/api/migrations/` and tracks them in `_mi
 ```bash
 # API worker
 wrangler secret put DATABASE_URL
+wrangler secret put POOL_DATABASE_URL
+wrangler secret put SESSION_SECRET
+wrangler secret put SUBSCRIPTION_TREASURY_ADDRESS
+wrangler secret put SUBSCRIPTION_PAYMENT_TOKEN_ADDRESS
+wrangler secret put SUBSCRIPTION_PAYMENT_CHAIN_ID
+wrangler secret put SUBSCRIPTION_MIN_CONFIRMATIONS
+wrangler secret put RPC_URL_BASE
 wrangler secret put PROTOCOL_FEE_RECIPIENT
 
 # Optional API vars
@@ -553,9 +596,10 @@ In the Cloudflare dashboard, add a custom domain route for your worker.
 ### Customization
 
 You can customize:
-- **Fee recipient** — change `OOB_FEE_RECIPIENT` in the order validation
+- **Fee recipient** — change `PROTOCOL_FEE_RECIPIENT`
 - **Supported chains** — modify the `validChains` array
-- **Rate limits** — adjust `RATE_LIMIT_READS_PER_MIN` and `RATE_LIMIT_WRITES_PER_MIN` in `wrangler.toml`
+- **Rate limits** — adjust the `RATE_LIMIT_*` worker vars and DB-backed plan entitlements
+- **Subscription plans** — modify seeded plans / entitlements in the subscription migration or follow-up admin tooling
 
 ---
 
@@ -572,7 +616,7 @@ The Open Order Book is fully open source under the MIT license.
 
 ### What's private
 
-- **Deployment secrets** — DATABASE_URL, API keys, treasury address
+- **Deployment secrets** — database URLs, session secret, API keys, payment configuration, treasury addresses, RPC credentials
 - **Marketplace-specific code** — nodz.space frontend and backend are separate projects
 
 ### Why open source?

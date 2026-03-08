@@ -19,6 +19,8 @@ import type {
   GetBestOrderParams,
   CreateListingParams,
   CreateOfferParams,
+  CreateTargetedOfferParams,
+  AcceptOpenOfferParams,
   FillOrderParams,
   OrdersResponse,
   SingleOrderResponse,
@@ -30,13 +32,15 @@ import type {
   SubmitOrderParams,
   OrderSubmissionMetadata,
   RoyaltyPolicyMode,
+  OriginFee,
 } from "./types.js";
 import {
   DEFAULT_API_URL,
-  DEFAULT_ORIGIN_FEE_BPS,
-  DEFAULT_ORIGIN_FEE_RECIPIENT,
+  DEFAULT_ORIGIN_FEES,
   DEFAULT_ROYALTY_POLICY,
+  ItemType,
   MAX_ORIGIN_FEE_BPS,
+  MAX_ORIGIN_FEE_RECIPIENTS,
 } from "./types.js";
 
 // ─── Input Validation ─────────────────────────────────────────────────────
@@ -66,11 +70,15 @@ function validateBps(value: number | undefined, label: string): void {
   }
 }
 
-function validateRoyaltyBps(value: number | undefined, label: string): void {
+function validateBpsWithMax(value: number | undefined, label: string, max: number): void {
   if (value === undefined || value === 0) return;
-  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > 10000) {
-    throw new Error(`Invalid ${label}: must be an integer between 0 and 10000 (got ${value})`);
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > max) {
+    throw new Error(`Invalid ${label}: must be an integer between 0 and ${max} (got ${value})`);
   }
+}
+
+function validateRoyaltyBps(value: number | undefined, label: string): void {
+  validateBpsWithMax(value, label, 10000);
 }
 
 interface ResolvedRoyalty {
@@ -94,6 +102,33 @@ const ERC2981_ABI = [
   },
 ] as const;
 
+function normalizeOriginFees(originFees?: OriginFee[]): OriginFee[] {
+  const normalized = (originFees ?? DEFAULT_ORIGIN_FEES).map((originFee) => ({
+    recipient: originFee.recipient.toLowerCase(),
+    bps: originFee.bps,
+  }));
+
+  if (normalized.length > MAX_ORIGIN_FEE_RECIPIENTS) {
+    throw new Error(`Invalid config: originFees supports at most ${MAX_ORIGIN_FEE_RECIPIENTS} recipients`);
+  }
+
+  let totalBps = 0;
+  for (const originFee of normalized) {
+    validateAddress(originFee.recipient, "originFees[].recipient");
+    validateBps(originFee.bps, "originFees[].bps");
+    if (originFee.bps <= 0) {
+      throw new Error("Invalid config: originFees[].bps must be greater than 0");
+    }
+    totalBps += originFee.bps;
+  }
+
+  if (totalBps > MAX_ORIGIN_FEE_BPS) {
+    throw new Error(`Invalid config: total origin fee exceeds ${MAX_ORIGIN_FEE_BPS} bps`);
+  }
+
+  return normalized;
+}
+
 export class OpenOrderBook {
   readonly config: Required<OobConfig>;
   readonly api: ApiClient;
@@ -103,16 +138,12 @@ export class OpenOrderBook {
   private publicClient?: PublicClient;
 
   constructor(config: OobConfig) {
-    validateBps(config.originFeeBps, "originFeeBps");
-    if ((config.originFeeBps ?? DEFAULT_ORIGIN_FEE_BPS) > 0 && !(config.originFeeRecipient ?? DEFAULT_ORIGIN_FEE_RECIPIENT)) {
-      throw new Error("Invalid config: originFeeRecipient is required when originFeeBps > 0");
-    }
+    const originFees = normalizeOriginFees(config.originFees);
     this.config = {
       chainId: config.chainId,
       apiUrl: config.apiUrl ?? DEFAULT_API_URL,
       apiKey: config.apiKey ?? "",
-      originFeeBps: config.originFeeBps ?? DEFAULT_ORIGIN_FEE_BPS,
-      originFeeRecipient: config.originFeeRecipient ?? DEFAULT_ORIGIN_FEE_RECIPIENT,
+      originFees,
       royaltyPolicy: config.royaltyPolicy ?? DEFAULT_ROYALTY_POLICY,
     };
 
@@ -156,9 +187,8 @@ export class OpenOrderBook {
   }): OrderSubmissionMetadata | undefined {
     const metadata: OrderSubmissionMetadata = {};
 
-    if ((this.config.originFeeBps ?? 0) > 0 && this.config.originFeeRecipient) {
-      metadata.originFeeBps = this.config.originFeeBps;
-      metadata.originFeeRecipient = this.config.originFeeRecipient;
+    if (this.config.originFees.length > 0) {
+      metadata.originFees = this.config.originFees.map((originFee) => ({ ...originFee }));
     }
 
     if ((params.royaltyBps ?? 0) > 0 && params.royaltyRecipient) {
@@ -396,17 +426,62 @@ export class OpenOrderBook {
   /**
    * Create an offer (bid on an NFT or collection).
    * Signs the order off-chain and submits to the API.
-   *
-   * @example
-   * const result = await oob.createOffer({
-   *   collection: '0x...',
-   *   tokenId: '42',
-   *   amountWei: '500000000000000000', // 0.5 WETH
-   *   currency: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', // WETH
-   * });
    */
   async createOffer(params: CreateOfferParams): Promise<SubmitOrderResponse> {
     validateAddress(params.collection, "collection");
+    validateAddress(params.currency, "currency");
+    validatePositiveBigInt(params.amountWei, "amountWei");
+
+    const { wallet, public: pub } = this.requireWallet();
+    const resolvedRoyalty = await this.resolveRoyaltyParams(pub, {
+      collection: params.collection,
+      tokenId: params.tokenId,
+      priceWei: params.amountWei,
+      royaltyBps: params.royaltyBps,
+      royaltyRecipient: params.royaltyRecipient,
+    });
+    const offerParams = {
+      ...params,
+      ...resolvedRoyalty,
+    };
+
+    const readiness = await this.seaport.checkErc20Readiness(
+      params.currency as Address,
+      wallet.account!.address as Address,
+      BigInt(params.amountWei),
+      pub,
+    );
+
+    if (!readiness.hasBalance) {
+      throw new InsufficientBalanceError(
+        params.currency,
+        readiness.balance,
+        BigInt(params.amountWei),
+      );
+    }
+
+    if (!readiness.hasAllowance) {
+      throw new NeedsApprovalError(
+        "erc20",
+        params.currency,
+        "ERC20 token is not approved for Seaport. Call oob.approveErc20() first.",
+      );
+    }
+
+    const protocolConfig = await this.api.getProtocolConfig();
+    const { order, signature } = await this.seaport.createOffer(offerParams, wallet, pub, protocolConfig);
+    return this.api.submitOrder(order, signature, {
+      metadata: this.buildSubmissionMetadata(offerParams),
+    });
+  }
+
+  /**
+   * Create a targeted offer for a specific NFT owned by a known seller.
+   * Signs the order off-chain and submits it to the API.
+   */
+  async createTargetedOffer(params: CreateTargetedOfferParams): Promise<SubmitOrderResponse> {
+    validateAddress(params.collection, "collection");
+    validateAddress(params.seller, "seller");
     validateAddress(params.currency, "currency");
     validatePositiveBigInt(params.amountWei, "amountWei");
 
@@ -450,7 +525,7 @@ export class OpenOrderBook {
     // Fetch current protocol fee from API (cached 5 min)
     const protocolConfig = await this.api.getProtocolConfig();
 
-    const { order, signature } = await this.seaport.createOffer(offerParams, wallet, pub, protocolConfig);
+    const { order, signature } = await this.seaport.createTargetedOffer(offerParams, wallet, pub, protocolConfig);
     return this.api.submitOrder(order, signature, {
       metadata: this.buildSubmissionMetadata(offerParams),
     });
@@ -480,6 +555,22 @@ export class OpenOrderBook {
     const filler = wallet.account!.address as Address;
 
     if (order.orderType === "offer") {
+      const feeRecipients = new Set<string>([
+        order.protocolFeeRecipient?.toLowerCase(),
+        ...(order.originFees ?? []).map((originFee) => originFee.recipient.toLowerCase()),
+        ...(order.royaltyRecipient ? [order.royaltyRecipient.toLowerCase()] : []),
+      ].filter(Boolean));
+      const hasExplicitSellerPayout = (order.orderJson?.consideration ?? []).some((item) => {
+        const itemType = Number(item.itemType);
+        if (itemType !== ItemType.NATIVE && itemType !== ItemType.ERC20) return false;
+        const recipient = item.recipient.toLowerCase();
+        return recipient !== order.offerer.toLowerCase() && !feeRecipients.has(recipient);
+      });
+
+      if (!hasExplicitSellerPayout) {
+        throw new Error("This order uses the open-offer match flow. Use acceptOpenOffer() instead of fillOrder().");
+      }
+
       // Seller accepting an offer: only needs NFT approval.
       // Fee consideration items are funded from the offerer's ERC20 offer amount
       // by Seaport during execution — the seller does not need ERC20 allowance.
@@ -523,6 +614,45 @@ export class OpenOrderBook {
     }
 
     return this.seaport.fillOrder(order, wallet, pub, params);
+  }
+
+  async acceptOpenOffer(orderHash: string, params?: AcceptOpenOfferParams): Promise<Hex> {
+    const { wallet, public: pub } = this.requireWallet();
+
+    const order = await this.getOrder(orderHash);
+    if (!order) throw new Error(`Order ${orderHash} not found`);
+    if (order.status !== "active") throw new Error(`Order is ${order.status}, not active`);
+    if (order.orderType !== "offer") throw new Error("acceptOpenOffer() can only be used for offer orders");
+
+    const feeRecipients = new Set<string>([
+      order.protocolFeeRecipient?.toLowerCase(),
+      ...(order.originFees ?? []).map((originFee) => originFee.recipient.toLowerCase()),
+      ...(order.royaltyRecipient ? [order.royaltyRecipient.toLowerCase()] : []),
+    ].filter(Boolean));
+    const hasExplicitSellerPayout = (order.orderJson?.consideration ?? []).some((item) => {
+      const itemType = Number(item.itemType);
+      if (itemType !== ItemType.NATIVE && itemType !== ItemType.ERC20) return false;
+      const recipient = item.recipient.toLowerCase();
+      return recipient !== order.offerer.toLowerCase() && !feeRecipients.has(recipient);
+    });
+    if (hasExplicitSellerPayout) {
+      throw new Error("This offer uses the direct fulfill path. Use fillOrder() instead of acceptOpenOffer().");
+    }
+
+    const nftApproved = await this.seaport.isApprovedForAll(
+      order.nftContract as Address,
+      wallet.account!.address as Address,
+      pub,
+    );
+    if (!nftApproved) {
+      throw new NeedsApprovalError(
+        "collection",
+        order.nftContract,
+        "NFT collection is not approved for Seaport. Call oob.approveCollection() first.",
+      );
+    }
+
+    return this.seaport.acceptOpenOffer(order, wallet, pub, params);
   }
 
   /**

@@ -6,10 +6,10 @@ import {
   OrderType,
   SUPPORTED_CHAINS,
   DEFAULT_API_URL,
-  DEFAULT_ORIGIN_FEE_BPS,
-  DEFAULT_ORIGIN_FEE_RECIPIENT,
+  DEFAULT_ORIGIN_FEES,
   DEFAULT_ROYALTY_POLICY,
   MAX_ORIGIN_FEE_BPS,
+  MAX_ORIGIN_FEE_RECIPIENTS,
   DEFAULT_LISTING_DURATION,
   DEFAULT_OFFER_DURATION,
 } from "../types.js";
@@ -44,17 +44,19 @@ describe("Constants", () => {
     expect(SUPPORTED_CHAINS[1]).toBeDefined();
     expect(SUPPORTED_CHAINS[8453]).toBeDefined();
     expect(SUPPORTED_CHAINS[84532]).toBeDefined();
+    expect(SUPPORTED_CHAINS[202601]).toBeDefined();
     expect(SUPPORTED_CHAINS[1].name).toBe("Ethereum");
     expect(SUPPORTED_CHAINS[8453].name).toBe("Base");
     expect(SUPPORTED_CHAINS[8453].nativeSymbol).toBe("ETH");
+    expect(SUPPORTED_CHAINS[202601].name).toBe("Ronin Saigon");
   });
 
-  it("DEFAULT_ORIGIN_FEE_BPS is 0 (origin fee defaults to none)", () => {
-    expect(DEFAULT_ORIGIN_FEE_BPS).toBe(0);
+  it("DEFAULT_ORIGIN_FEES is empty (origin fee defaults to none)", () => {
+    expect(DEFAULT_ORIGIN_FEES).toEqual([]);
   });
 
-  it("DEFAULT_ORIGIN_FEE_RECIPIENT is empty (originator sets their own)", () => {
-    expect(DEFAULT_ORIGIN_FEE_RECIPIENT).toBe("");
+  it("MAX_ORIGIN_FEE_RECIPIENTS is 5", () => {
+    expect(MAX_ORIGIN_FEE_RECIPIENTS).toBe(5);
   });
 
   it("DEFAULT_ROYALTY_POLICY is manual_only", () => {

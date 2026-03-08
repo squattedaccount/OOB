@@ -117,7 +117,7 @@ export async function processLifecycleEvents(
       } else if (evt.type === "counter_incremented" && evt.offerer) {
         const result = await sql`
           UPDATE seaport_orders
-          SET status = 'cancelled', cancelled_at = NOW()
+          SET status = 'cancelled', cancelled_tx_hash = ${evt.txHash}, cancelled_at = NOW()
           WHERE offerer = ${evt.offerer}
             AND chain_id = ${evt.chainId}
             AND status = 'active'
@@ -135,6 +135,7 @@ export async function processLifecycleEvents(
             nftContract: r.nft_contract,
             tokenId: r.token_id,
             priceWei: r.price_wei,
+            txHash: evt.txHash,
           });
         }
       }

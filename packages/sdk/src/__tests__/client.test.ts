@@ -10,7 +10,7 @@ vi.mock("viem", () => ({
 }));
 
 import { OpenOrderBook, NeedsApprovalError, InsufficientBalanceError } from "../client.js";
-import { DEFAULT_API_URL, DEFAULT_ORIGIN_FEE_BPS, DEFAULT_ORIGIN_FEE_RECIPIENT, DEFAULT_ROYALTY_POLICY } from "../types.js";
+import { DEFAULT_API_URL, DEFAULT_ORIGIN_FEES, DEFAULT_ROYALTY_POLICY } from "../types.js";
 
 // Mock fetch globally
 const mockFetch = vi.fn();
@@ -28,8 +28,7 @@ describe("OpenOrderBook", () => {
     it("sets default config values", () => {
       expect(oob.config.chainId).toBe(8453);
       expect(oob.config.apiUrl).toBe(DEFAULT_API_URL);
-      expect(oob.config.originFeeBps).toBe(DEFAULT_ORIGIN_FEE_BPS);
-      expect(oob.config.originFeeRecipient).toBe(DEFAULT_ORIGIN_FEE_RECIPIENT);
+      expect(oob.config.originFees).toEqual(DEFAULT_ORIGIN_FEES);
       expect(oob.config.royaltyPolicy).toBe(DEFAULT_ROYALTY_POLICY);
     });
 
@@ -38,13 +37,12 @@ describe("OpenOrderBook", () => {
         chainId: 1,
         apiUrl: "https://custom.api",
         apiKey: "my-key",
-        originFeeBps: 100,
-        originFeeRecipient: "0x1234567890123456789012345678901234567890",
+        originFees: [{ recipient: "0x1234567890123456789012345678901234567890", bps: 100 }],
       });
       expect(custom.config.chainId).toBe(1);
       expect(custom.config.apiUrl).toBe("https://custom.api");
       expect(custom.config.apiKey).toBe("my-key");
-      expect(custom.config.originFeeBps).toBe(100);
+      expect(custom.config.originFees).toEqual([{ recipient: "0x1234567890123456789012345678901234567890", bps: 100 }]);
       expect(custom.config.royaltyPolicy).toBe(DEFAULT_ROYALTY_POLICY);
     });
 
@@ -163,6 +161,18 @@ describe("OpenOrderBook", () => {
       ).rejects.toThrow("Wallet not connected");
     });
 
+    it("createTargetedOffer throws without wallet", async () => {
+      await expect(
+        oob.createTargetedOffer({
+          collection: "0x1234567890123456789012345678901234567890",
+          tokenId: "1",
+          seller: "0x1111111111111111111111111111111111111111",
+          amountWei: "500000000000000000",
+          currency: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        }),
+      ).rejects.toThrow("Wallet not connected");
+    });
+
     it("createOffer throws without wallet", async () => {
       await expect(
         oob.createOffer({
@@ -172,6 +182,10 @@ describe("OpenOrderBook", () => {
           currency: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
         }),
       ).rejects.toThrow("Wallet not connected");
+    });
+
+    it("acceptOpenOffer throws without wallet", async () => {
+      await expect(oob.acceptOpenOffer("0xhash")).rejects.toThrow("Wallet not connected");
     });
 
     it("fillOrder throws without wallet", async () => {
@@ -289,6 +303,28 @@ describe("OpenOrderBook", () => {
       return publicClient;
     }
 
+    function setupCreateTargetedOffer(oobClient: OpenOrderBook, publicClientOverrides: Record<string, any> = {}) {
+      const publicClient = {
+        readContract: vi.fn(),
+        ...publicClientOverrides,
+      } as any;
+
+      oobClient.connect(wallet, publicClient);
+      vi.spyOn(oobClient.seaport, "checkErc20Readiness").mockResolvedValue({
+        hasBalance: true,
+        hasAllowance: true,
+        balance: 10000n,
+        allowance: 10000n,
+      } as any);
+      vi.spyOn(oobClient.api, "getProtocolConfig").mockResolvedValue(protocolConfig);
+      vi.spyOn(oobClient.seaport, "createTargetedOffer").mockResolvedValue({
+        order: { offerer: wallet.account.address, consideration: [], offer: [] } as any,
+        signature: "0xsig" as any,
+      });
+      vi.spyOn(oobClient.api, "submitOrder").mockResolvedValue({ orderHash: "0xhash", status: "active" });
+      return publicClient;
+    }
+
     it("manual_only embeds explicitly provided listing royalty", async () => {
       const client = new OpenOrderBook({ chainId: 8453, royaltyPolicy: "manual_only" });
       setupCreateListing(client);
@@ -392,16 +428,17 @@ describe("OpenOrderBook", () => {
 
     it("explicit royalty takes precedence over auto_eip2981", async () => {
       const client = new OpenOrderBook({ chainId: 8453, royaltyPolicy: "auto_eip2981" });
-      const publicClient = setupCreateOffer(client);
+      const publicClient = setupCreateTargetedOffer(client);
 
-      await client.createOffer({
+      await client.createTargetedOffer({
         ...baseOfferParams,
+        seller: "0x5555555555555555555555555555555555555555",
         royaltyRecipient: "0x4444444444444444444444444444444444444444",
         royaltyBps: 250,
       });
 
       expect(publicClient.readContract).not.toHaveBeenCalled();
-      expect(client.seaport.createOffer).toHaveBeenCalledWith(
+      expect(client.seaport.createTargetedOffer).toHaveBeenCalledWith(
         expect.objectContaining({ royaltyRecipient: "0x4444444444444444444444444444444444444444", royaltyBps: 250 }),
         expect.anything(),
         expect.anything(),
@@ -429,6 +466,93 @@ describe("OpenOrderBook", () => {
       expect(err.message).toContain("100");
       expect(err.message).toContain("500");
       expect(err).toBeInstanceOf(Error);
+    });
+  });
+
+  describe("offer execution path guards", () => {
+    it("acceptOpenOffer rejects targeted offers that should use fillOrder", async () => {
+      const client = new OpenOrderBook({ chainId: 8453 });
+      const wallet = {
+        account: { address: "0x1234567890123456789012345678901234567890" },
+      } as any;
+      const publicClient = {
+        readContract: vi.fn(),
+      } as any;
+
+      client.connect(wallet, publicClient);
+      vi.spyOn(client, "getOrder").mockResolvedValue({
+        orderHash: "0xhash",
+        chainId: 8453,
+        orderType: "offer",
+        offerer: "0x9999999999999999999999999999999999999999",
+        nftContract: "0x1234567890123456789012345678901234567890",
+        tokenId: "1",
+        tokenStandard: "ERC721",
+        priceWei: "10000",
+        currency: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        protocolFeeRecipient: "0x0000000000000000000000000000000000000001",
+        protocolFeeBps: 33,
+        originFees: [],
+        royaltyRecipient: null,
+        royaltyBps: 0,
+        startTime: 1,
+        endTime: 9999999999,
+        status: "active",
+        createdAt: new Date().toISOString(),
+        filledTxHash: null,
+        filledAt: null,
+        cancelledTxHash: null,
+        cancelledAt: null,
+        signature: "0xsig",
+        orderJson: {
+          offerer: "0x9999999999999999999999999999999999999999",
+          zone: "0x0000000000000000000000000000000000000000",
+          offer: [
+            {
+              itemType: 1,
+              token: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+              identifierOrCriteria: "0",
+              startAmount: "10000",
+              endAmount: "10000",
+            },
+          ],
+          consideration: [
+            {
+              itemType: 2,
+              token: "0x1234567890123456789012345678901234567890",
+              identifierOrCriteria: "1",
+              startAmount: "1",
+              endAmount: "1",
+              recipient: "0x9999999999999999999999999999999999999999",
+            },
+            {
+              itemType: 1,
+              token: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+              identifierOrCriteria: "0",
+              startAmount: "9967",
+              endAmount: "9967",
+              recipient: "0x2222222222222222222222222222222222222222",
+            },
+            {
+              itemType: 1,
+              token: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+              identifierOrCriteria: "0",
+              startAmount: "33",
+              endAmount: "33",
+              recipient: "0x0000000000000000000000000000000000000001",
+            },
+          ],
+          orderType: 0,
+          startTime: "1",
+          endTime: "9999999999",
+          zoneHash: "0x" + "0".repeat(64),
+          salt: "1",
+          conduitKey: "0x" + "0".repeat(64),
+          counter: "0",
+        },
+      } as any);
+
+      await expect(client.acceptOpenOffer("0xhash")).rejects.toThrow("Use fillOrder() instead of acceptOpenOffer()");
     });
   });
 

@@ -3,16 +3,19 @@
  * Logs structured JSON to console (captured by Cloudflare Workers Logs).
  */
 
-import type { Env } from "./types.js";
+import type { Env, RequestApiAccess } from "./types.js";
+import { resolveRequestApiAccess } from "./subscriptions.js";
 
 export async function logRequestAudit(
     request: Request,
     env: Env,
     path: string,
+    access?: RequestApiAccess,
 ): Promise<void> {
     try {
         const ip = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
         const apiKey = request.headers.get("x-api-key");
+        const resolvedAccess = access ?? await resolveRequestApiAccess(request, env);
         const userAgent = request.headers.get("user-agent") || "unknown";
         const contentLength = Number(request.headers.get("content-length") || "0");
 
@@ -37,7 +40,7 @@ export async function logRequestAudit(
             apiKeyHash,
             userAgent,
             contentLength,
-            source: apiKey ? "registered" : "public",
+            source: resolvedAccess.isRegistered ? "registered" : "public",
         }));
     } catch {
         // Audit logging should never break request processing

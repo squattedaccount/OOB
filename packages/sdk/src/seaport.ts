@@ -18,11 +18,11 @@ import {
   SEAPORT_ADDRESS,
   ItemType,
   OrderType,
-  DEFAULT_ORIGIN_FEE_BPS,
-  DEFAULT_ORIGIN_FEE_RECIPIENT,
+  DEFAULT_ORIGIN_FEES,
   MAX_ORIGIN_FEE_BPS,
   DEFAULT_LISTING_DURATION,
   DEFAULT_OFFER_DURATION,
+  type OriginFee,
   type SeaportOrderComponents,
   type SeaportOfferItem,
   type SeaportConsiderationItem,
@@ -30,6 +30,8 @@ import {
   type ProtocolConfig,
   type CreateListingParams,
   type CreateOfferParams,
+  type CreateTargetedOfferParams,
+  type AcceptOpenOfferParams,
   type FillOrderParams,
   type OobOrder,
 } from "./types.js";
@@ -62,6 +64,119 @@ const ERC20_ABI = parseAbi([
   "function allowance(address owner, address spender) view returns (uint256)",
   "function approve(address spender, uint256 amount) returns (bool)",
 ]);
+
+const MATCH_ADVANCED_ORDERS_ABI = [
+  {
+    name: "matchAdvancedOrders",
+    type: "function" as const,
+    stateMutability: "payable" as const,
+    inputs: [
+      {
+        name: "orders",
+        type: "tuple[]" as const,
+        components: [
+          {
+            name: "parameters",
+            type: "tuple" as const,
+            components: [
+              { name: "offerer", type: "address" as const },
+              { name: "zone", type: "address" as const },
+              {
+                name: "offer",
+                type: "tuple[]" as const,
+                components: [
+                  { name: "itemType", type: "uint8" as const },
+                  { name: "token", type: "address" as const },
+                  { name: "identifierOrCriteria", type: "uint256" as const },
+                  { name: "startAmount", type: "uint256" as const },
+                  { name: "endAmount", type: "uint256" as const },
+                ],
+              },
+              {
+                name: "consideration",
+                type: "tuple[]" as const,
+                components: [
+                  { name: "itemType", type: "uint8" as const },
+                  { name: "token", type: "address" as const },
+                  { name: "identifierOrCriteria", type: "uint256" as const },
+                  { name: "startAmount", type: "uint256" as const },
+                  { name: "endAmount", type: "uint256" as const },
+                  { name: "recipient", type: "address" as const },
+                ],
+              },
+              { name: "orderType", type: "uint8" as const },
+              { name: "startTime", type: "uint256" as const },
+              { name: "endTime", type: "uint256" as const },
+              { name: "zoneHash", type: "bytes32" as const },
+              { name: "salt", type: "uint256" as const },
+              { name: "conduitKey", type: "bytes32" as const },
+              { name: "totalOriginalConsiderationItems", type: "uint256" as const },
+            ],
+          },
+          { name: "numerator", type: "uint120" as const },
+          { name: "denominator", type: "uint120" as const },
+          { name: "signature", type: "bytes" as const },
+          { name: "extraData", type: "bytes" as const },
+        ],
+      },
+      {
+        name: "criteriaResolvers",
+        type: "tuple[]" as const,
+        components: [
+          { name: "orderIndex", type: "uint256" as const },
+          { name: "side", type: "uint8" as const },
+          { name: "index", type: "uint256" as const },
+          { name: "identifier", type: "uint256" as const },
+          { name: "criteriaProof", type: "bytes32[]" as const },
+        ],
+      },
+      {
+        name: "fulfillments",
+        type: "tuple[]" as const,
+        components: [
+          {
+            name: "offerComponents",
+            type: "tuple[]" as const,
+            components: [
+              { name: "orderIndex", type: "uint256" as const },
+              { name: "itemIndex", type: "uint256" as const },
+            ],
+          },
+          {
+            name: "considerationComponents",
+            type: "tuple[]" as const,
+            components: [
+              { name: "orderIndex", type: "uint256" as const },
+              { name: "itemIndex", type: "uint256" as const },
+            ],
+          },
+        ],
+      },
+      { name: "recipient", type: "address" as const },
+    ],
+    outputs: [
+      {
+        name: "executions",
+        type: "tuple[]" as const,
+        components: [
+          {
+            name: "item",
+            type: "tuple" as const,
+            components: [
+              { name: "itemType", type: "uint8" as const },
+              { name: "token", type: "address" as const },
+              { name: "identifier", type: "uint256" as const },
+              { name: "amount", type: "uint256" as const },
+              { name: "recipient", type: "address" as const },
+            ],
+          },
+          { name: "offerer", type: "address" as const },
+          { name: "conduitKey", type: "bytes32" as const },
+        ],
+      },
+    ],
+  },
+] as const;
 
 // ─── EIP-712 Domain & Types for Seaport ─────────────────────────────────────
 
@@ -112,20 +227,11 @@ const SEAPORT_ORDER_TYPE = {
 
 export class SeaportClient {
   private chainId: number;
-  private originFeeBps: number;
-  private originFeeRecipient: string;
+  private originFees: OriginFee[];
 
   constructor(config: OobConfig) {
-    const originFeeBps = config.originFeeBps ?? DEFAULT_ORIGIN_FEE_BPS;
-    if (originFeeBps !== 0 && (!Number.isFinite(originFeeBps) || !Number.isInteger(originFeeBps) || originFeeBps < 0 || originFeeBps > MAX_ORIGIN_FEE_BPS)) {
-      throw new Error(`Invalid originFeeBps: must be an integer between 0 and ${MAX_ORIGIN_FEE_BPS} (got ${originFeeBps})`);
-    }
-    if (originFeeBps > 0 && !(config.originFeeRecipient ?? DEFAULT_ORIGIN_FEE_RECIPIENT)) {
-      throw new Error("Invalid config: originFeeRecipient is required when originFeeBps > 0");
-    }
     this.chainId = config.chainId;
-    this.originFeeBps = originFeeBps;
-    this.originFeeRecipient = config.originFeeRecipient ?? DEFAULT_ORIGIN_FEE_RECIPIENT;
+    this.originFees = config.originFees ?? DEFAULT_ORIGIN_FEES;
   }
 
   // ─── Order Construction ─────────────────────────────────────────────────
@@ -158,12 +264,13 @@ export class SeaportClient {
     const protocolFeeBps = protocolConfig?.protocolFeeBps ?? 0;
     const protocolFeeRecipient = protocolConfig?.protocolFeeRecipient ?? "";
     const royaltyBps = params.royaltyBps ?? 0;
+    const totalOriginFeeBps = this.originFees.reduce((sum, originFee) => sum + originFee.bps, 0);
 
     // Validate total deductions do not exceed 100%
-    const totalBps = protocolFeeBps + this.originFeeBps + royaltyBps;
+    const totalBps = protocolFeeBps + totalOriginFeeBps + royaltyBps;
     if (totalBps > 10000) {
       throw new Error(
-        `Total fees exceed 100%: protocolFee=${protocolFeeBps} + originFee=${this.originFeeBps} + royalty=${royaltyBps} = ${totalBps} bps`,
+        `Total fees exceed 100%: protocolFee=${protocolFeeBps} + originFee=${totalOriginFeeBps} + royalty=${royaltyBps} = ${totalBps} bps`,
       );
     }
 
@@ -171,10 +278,12 @@ export class SeaportClient {
       ? (priceWei * BigInt(protocolFeeBps)) / 10000n
       : 0n;
 
-    // Calculate origin fee (from SDK config)
-    const originFeeAmount = this.originFeeBps > 0 && this.originFeeRecipient
-      ? (priceWei * BigInt(this.originFeeBps)) / 10000n
-      : 0n;
+    const originFeeAmounts = this.originFees.map((originFee) => ({
+      recipient: originFee.recipient,
+      amount: (priceWei * BigInt(originFee.bps)) / 10000n,
+    })).filter((originFee) => originFee.amount > 0n);
+
+    const originFeeAmount = originFeeAmounts.reduce((sum, originFee) => sum + originFee.amount, 0n);
 
     const totalFees = protocolFeeAmount + originFeeAmount;
     const sellerProceeds = priceWei - totalFees;
@@ -203,15 +312,15 @@ export class SeaportClient {
       });
     }
 
-    // Add origin fee
-    if (originFeeAmount > 0n && this.originFeeRecipient) {
+    // Add origin fee splits
+    for (const originFee of originFeeAmounts) {
       consideration.push({
         itemType: currencyItemType,
         token: currency,
         identifierOrCriteria: "0",
-        startAmount: originFeeAmount.toString(),
-        endAmount: originFeeAmount.toString(),
-        recipient: getAddress(this.originFeeRecipient),
+        startAmount: originFee.amount.toString(),
+        endAmount: originFee.amount.toString(),
+        recipient: getAddress(originFee.recipient),
       });
     }
 
@@ -278,7 +387,8 @@ export class SeaportClient {
 
   /**
    * Build and sign an offer order (buyer offers ERC20, wants NFT).
-   * Fees are added as consideration items (paid from the offer amount by the seller).
+   * Open offers and collection offers require a match/mirror-order flow and are not
+   * currently supported by this helper.
    */
   async createOffer(
     params: CreateOfferParams,
@@ -292,51 +402,45 @@ export class SeaportClient {
     const offerer = getAddress(account.address);
     const amountWei = BigInt(params.amountWei);
     const currency = getAddress(params.currency);
-
-    // Calculate protocol fee (from API config)
     const protocolFeeBps = protocolConfig?.protocolFeeBps ?? 0;
     const protocolFeeRecipient = protocolConfig?.protocolFeeRecipient ?? "";
     const royaltyBps = params.royaltyBps ?? 0;
+    const totalOriginFeeBps = this.originFees.reduce((sum, originFee) => sum + originFee.bps, 0);
+    const totalFeeBps = protocolFeeBps + totalOriginFeeBps + royaltyBps;
 
-    // Validate total deductions do not exceed 100%
-    const totalBps = protocolFeeBps + this.originFeeBps + royaltyBps;
-    if (totalBps > 10000) {
+    if (totalFeeBps > 10000) {
       throw new Error(
-        `Total fees exceed 100%: protocolFee=${protocolFeeBps} + originFee=${this.originFeeBps} + royalty=${royaltyBps} = ${totalBps} bps`,
+        `Total fees exceed 100%: protocolFee=${protocolFeeBps} + originFee=${totalOriginFeeBps} + royalty=${royaltyBps} = ${totalFeeBps} bps`,
       );
     }
 
     const protocolFeeAmount = protocolFeeBps > 0 && protocolFeeRecipient
       ? (amountWei * BigInt(protocolFeeBps)) / 10000n
       : 0n;
+    const originFeeAmounts = this.originFees.map((originFee) => ({
+      recipient: originFee.recipient,
+      amount: (amountWei * BigInt(originFee.bps)) / 10000n,
+    })).filter((originFee) => originFee.amount > 0n);
 
-    // Calculate origin fee (from SDK config)
-    const originFeeAmount = this.originFeeBps > 0 && this.originFeeRecipient
-      ? (amountWei * BigInt(this.originFeeBps)) / 10000n
-      : 0n;
-
-    // Determine if this is a specific token offer or collection offer
-    const isCollectionOffer = !params.tokenId;
     const isERC1155 = params.tokenStandard === "ERC1155";
-    const nftItemType = isCollectionOffer
-      ? (isERC1155 ? ItemType.ERC1155_WITH_CRITERIA : ItemType.ERC721_WITH_CRITERIA)
-      : (isERC1155 ? ItemType.ERC1155 : ItemType.ERC721);
-    const tokenIdOrCriteria = params.tokenId ?? "0";
+    const hasSpecificTokenId = params.tokenId !== undefined;
+    const criteriaIdentifier = params.tokenId ?? "0";
+    const nftItemType = hasSpecificTokenId
+      ? (isERC1155 ? ItemType.ERC1155 : ItemType.ERC721)
+      : (isERC1155 ? ItemType.ERC1155_WITH_CRITERIA : ItemType.ERC721_WITH_CRITERIA);
     const nftQuantity = params.quantity ? String(params.quantity) : "1";
 
     const consideration: SeaportConsiderationItem[] = [
-      // Offerer wants the NFT
       {
         itemType: nftItemType,
         token: getAddress(params.collection),
-        identifierOrCriteria: tokenIdOrCriteria,
+        identifierOrCriteria: criteriaIdentifier,
         startAmount: nftQuantity,
         endAmount: nftQuantity,
         recipient: offerer,
       },
     ];
 
-    // Protocol fee (OOB — paid from the offer amount by the seller)
     if (protocolFeeAmount > 0n && protocolFeeRecipient) {
       consideration.push({
         itemType: ItemType.ERC20,
@@ -348,41 +452,39 @@ export class SeaportClient {
       });
     }
 
-    // Origin fee
-    if (originFeeAmount > 0n && this.originFeeRecipient) {
+    for (const originFee of originFeeAmounts) {
       consideration.push({
         itemType: ItemType.ERC20,
         token: currency,
         identifierOrCriteria: "0",
-        startAmount: originFeeAmount.toString(),
-        endAmount: originFeeAmount.toString(),
-        recipient: getAddress(this.originFeeRecipient),
+        startAmount: originFee.amount.toString(),
+        endAmount: originFee.amount.toString(),
+        recipient: getAddress(originFee.recipient),
       });
     }
 
-    // Royalty
-    if (params.royaltyBps && params.royaltyRecipient) {
-      const royaltyAmount = (amountWei * BigInt(params.royaltyBps)) / 10000n;
-      consideration.push({
-        itemType: ItemType.ERC20,
-        token: currency,
-        identifierOrCriteria: "0",
-        startAmount: royaltyAmount.toString(),
-        endAmount: royaltyAmount.toString(),
-        recipient: getAddress(params.royaltyRecipient),
-      });
+    if (royaltyBps > 0 && params.royaltyRecipient) {
+      const royaltyAmount = (amountWei * BigInt(royaltyBps)) / 10000n;
+      if (royaltyAmount > 0n) {
+        consideration.push({
+          itemType: ItemType.ERC20,
+          token: currency,
+          identifierOrCriteria: "0",
+          startAmount: royaltyAmount.toString(),
+          endAmount: royaltyAmount.toString(),
+          recipient: getAddress(params.royaltyRecipient),
+        });
+      }
     }
 
     const now = Math.floor(Date.now() / 1000);
     const duration = params.duration ?? DEFAULT_OFFER_DURATION;
-
     const counter = await publicClient.readContract({
       address: SEAPORT_ADDRESS as Address,
       abi: SEAPORT_ABI,
       functionName: "getCounter",
       args: [offerer],
     }) as bigint;
-
     const salt = BigInt(keccak256(
       encodeAbiParameters(
         parseAbiParameters("address, uint256, uint256"),
@@ -413,7 +515,144 @@ export class SeaportClient {
     };
 
     const signature = await this.signOrder(order, walletClient);
+    return { order, signature };
+  }
 
+  async createTargetedOffer(
+    params: CreateTargetedOfferParams,
+    walletClient: WalletClient,
+    publicClient: PublicClient,
+    protocolConfig?: ProtocolConfig,
+  ): Promise<{ order: SeaportOrderComponents; signature: Hex }> {
+    const account = walletClient.account;
+    if (!account) throw new Error("WalletClient must have an account");
+
+    const offerer = getAddress(account.address);
+    const seller = getAddress(params.seller);
+    const amountWei = BigInt(params.amountWei);
+    const currency = getAddress(params.currency);
+    const royaltyBps = params.royaltyBps ?? 0;
+    const protocolFeeBps = protocolConfig?.protocolFeeBps ?? 0;
+    const protocolFeeRecipient = protocolConfig?.protocolFeeRecipient ?? "";
+    const totalOriginFeeBps = this.originFees.reduce((sum, originFee) => sum + originFee.bps, 0);
+    const totalFeeBps = protocolFeeBps + totalOriginFeeBps + royaltyBps;
+
+    if (totalFeeBps > 10000) {
+      throw new Error(
+        `Total fees exceed 100%: protocolFee=${protocolFeeBps} + originFee=${totalOriginFeeBps} + royalty=${royaltyBps} = ${totalFeeBps} bps`,
+      );
+    }
+
+    const protocolFeeAmount = protocolFeeBps > 0 && protocolFeeRecipient
+      ? (amountWei * BigInt(protocolFeeBps)) / 10000n
+      : 0n;
+    const originFeeAmounts = this.originFees.map((originFee) => ({
+      recipient: originFee.recipient,
+      amount: (amountWei * BigInt(originFee.bps)) / 10000n,
+    })).filter((originFee) => originFee.amount > 0n);
+    const royaltyAmount = royaltyBps > 0 && params.royaltyRecipient
+      ? (amountWei * BigInt(royaltyBps)) / 10000n
+      : 0n;
+    const sellerPayout = amountWei - protocolFeeAmount - royaltyAmount - originFeeAmounts.reduce((sum, item) => sum + item.amount, 0n);
+
+    if (sellerPayout <= 0n) {
+      throw new Error("Targeted offer net seller payout must be greater than zero");
+    }
+
+    const isERC1155 = params.tokenStandard === "ERC1155";
+    const nftItemType = isERC1155 ? ItemType.ERC1155 : ItemType.ERC721;
+    const nftQuantity = params.quantity ? String(params.quantity) : "1";
+
+    const consideration: SeaportConsiderationItem[] = [
+      {
+        itemType: nftItemType,
+        token: getAddress(params.collection),
+        identifierOrCriteria: params.tokenId,
+        startAmount: nftQuantity,
+        endAmount: nftQuantity,
+        recipient: offerer,
+      },
+      {
+        itemType: ItemType.ERC20,
+        token: currency,
+        identifierOrCriteria: "0",
+        startAmount: sellerPayout.toString(),
+        endAmount: sellerPayout.toString(),
+        recipient: seller,
+      },
+    ];
+
+    if (protocolFeeAmount > 0n && protocolFeeRecipient) {
+      consideration.push({
+        itemType: ItemType.ERC20,
+        token: currency,
+        identifierOrCriteria: "0",
+        startAmount: protocolFeeAmount.toString(),
+        endAmount: protocolFeeAmount.toString(),
+        recipient: getAddress(protocolFeeRecipient),
+      });
+    }
+
+    for (const originFee of originFeeAmounts) {
+      consideration.push({
+        itemType: ItemType.ERC20,
+        token: currency,
+        identifierOrCriteria: "0",
+        startAmount: originFee.amount.toString(),
+        endAmount: originFee.amount.toString(),
+        recipient: getAddress(originFee.recipient),
+      });
+    }
+
+    if (royaltyAmount > 0n && params.royaltyRecipient) {
+      consideration.push({
+        itemType: ItemType.ERC20,
+        token: currency,
+        identifierOrCriteria: "0",
+        startAmount: royaltyAmount.toString(),
+        endAmount: royaltyAmount.toString(),
+        recipient: getAddress(params.royaltyRecipient),
+      });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const duration = params.duration ?? DEFAULT_OFFER_DURATION;
+    const counter = await publicClient.readContract({
+      address: SEAPORT_ADDRESS as Address,
+      abi: SEAPORT_ABI,
+      functionName: "getCounter",
+      args: [offerer],
+    }) as bigint;
+    const salt = BigInt(keccak256(
+      encodeAbiParameters(
+        parseAbiParameters("address, uint256, uint256"),
+        [offerer, BigInt(now), BigInt(Math.floor(Math.random() * 1e18))],
+      ),
+    ));
+
+    const order: SeaportOrderComponents = {
+      offerer,
+      zone: "0x0000000000000000000000000000000000000000",
+      offer: [
+        {
+          itemType: ItemType.ERC20,
+          token: currency,
+          identifierOrCriteria: "0",
+          startAmount: amountWei.toString(),
+          endAmount: amountWei.toString(),
+        },
+      ],
+      consideration,
+      orderType: OrderType.FULL_OPEN,
+      startTime: now.toString(),
+      endTime: (now + duration).toString(),
+      zoneHash: "0x0000000000000000000000000000000000000000000000000000000000000000",
+      salt: salt.toString(),
+      conduitKey: "0x0000000000000000000000000000000000000000000000000000000000000000",
+      counter: counter.toString(),
+    };
+
+    const signature = await this.signOrder(order, walletClient);
     return { order, signature };
   }
 
@@ -528,6 +767,49 @@ export class SeaportClient {
 
       return hash;
     }
+  }
+
+  async acceptOpenOffer(
+    oobOrder: OobOrder,
+    walletClient: WalletClient,
+    publicClient: PublicClient,
+    params?: AcceptOpenOfferParams,
+  ): Promise<Hex> {
+    const account = walletClient.account;
+    if (!account) throw new Error("WalletClient must have an account");
+
+    const criteriaResolvers = this.buildOpenOfferCriteriaResolvers(oobOrder, params);
+    const originalParams = this.buildOrderParameters(oobOrder.orderJson);
+    const { mirrorOrder, value } = await this.buildMirrorAcceptOfferOrder(
+      oobOrder,
+      walletClient,
+      publicClient,
+      criteriaResolvers,
+    );
+
+    return walletClient.writeContract({
+      address: SEAPORT_ADDRESS as Address,
+      abi: MATCH_ADVANCED_ORDERS_ABI,
+      functionName: "matchAdvancedOrders",
+      args: [
+        [
+          {
+            parameters: originalParams,
+            numerator: 1n,
+            denominator: 1n,
+            signature: oobOrder.signature as Hex,
+            extraData: "0x" as Hex,
+          },
+          mirrorOrder,
+        ],
+        criteriaResolvers,
+        this.buildAcceptOfferFulfillments(oobOrder.orderJson),
+        "0x0000000000000000000000000000000000000000" as Address,
+      ],
+      value,
+      account,
+      chain: walletClient.chain,
+    });
   }
 
   /**
@@ -778,5 +1060,150 @@ export class SeaportClient {
       conduitKey: order.conduitKey as Hex,
       counter: BigInt(order.counter),
     };
+  }
+
+  private buildOpenOfferCriteriaResolvers(oobOrder: OobOrder, params?: AcceptOpenOfferParams) {
+    const nftItem = oobOrder.orderJson.consideration.find((item) => Number(item.itemType) >= ItemType.ERC721);
+    if (!nftItem) {
+      throw new Error("Open offer is missing the NFT consideration item");
+    }
+
+    const itemType = Number(nftItem.itemType);
+    if (itemType !== ItemType.ERC721_WITH_CRITERIA && itemType !== ItemType.ERC1155_WITH_CRITERIA) {
+      return [];
+    }
+
+    if (!params?.tokenId) {
+      throw new Error("acceptOpenOffer() requires tokenId when accepting collection or criteria offers");
+    }
+
+    const isCriteria = (oobOrder.assetScope ?? "token") === "criteria" || (oobOrder.identifierOrCriteria ?? "0") !== "0";
+    if (isCriteria && params.criteriaProof === undefined) {
+      throw new Error("acceptOpenOffer() requires criteriaProof for criteria-based offers");
+    }
+
+    return [
+      {
+        orderIndex: 0n,
+        side: 1,
+        index: 0n,
+        identifier: BigInt(params.tokenId),
+        criteriaProof: (params.criteriaProof ?? []) as Hex[],
+      },
+    ];
+  }
+
+  private async buildMirrorAcceptOfferOrder(
+    oobOrder: OobOrder,
+    walletClient: WalletClient,
+    publicClient: PublicClient,
+    criteriaResolvers: Array<{ orderIndex: bigint; side: number; index: bigint; identifier: bigint; criteriaProof: Hex[] }>,
+  ) {
+    const account = walletClient.account;
+    if (!account) throw new Error("WalletClient must have an account");
+
+    const seller = getAddress(account.address);
+    const order = oobOrder.orderJson;
+    const resolvedIdentifier = criteriaResolvers[0]?.identifier;
+    const mirrorOffer = order.consideration
+      .filter((item) => Number(item.itemType) >= ItemType.ERC721)
+      .map((item) => ({
+        itemType: Number(item.itemType) < ItemType.ERC721_WITH_CRITERIA
+          ? item.itemType
+          : (Number(item.itemType) - 2) as typeof item.itemType,
+        token: getAddress(item.token),
+        identifierOrCriteria: resolvedIdentifier !== undefined
+          ? resolvedIdentifier.toString()
+          : item.identifierOrCriteria,
+        startAmount: item.startAmount,
+        endAmount: item.endAmount,
+      }));
+
+    const mirrorConsideration = order.offer.map((item) => {
+      const itemType = Number(item.itemType);
+      const deductedAmount = order.consideration
+        .filter((considerationItem) => Number(considerationItem.itemType) < ItemType.ERC721)
+        .filter((considerationItem) => Number(considerationItem.itemType) === itemType)
+        .filter((considerationItem) => getAddress(considerationItem.token) === getAddress(item.token))
+        .reduce((sum, considerationItem) => sum + BigInt(considerationItem.endAmount), 0n);
+      const netAmount = BigInt(item.endAmount) - deductedAmount;
+      if (netAmount <= 0n) {
+        throw new Error("Open offer mirror order would leave the seller with zero payout");
+      }
+      return {
+        itemType: itemType < ItemType.ERC721_WITH_CRITERIA ? item.itemType : ((itemType - 2) as typeof item.itemType),
+        token: getAddress(item.token),
+        identifierOrCriteria: resolvedIdentifier !== undefined ? resolvedIdentifier.toString() : item.identifierOrCriteria,
+        recipient: seller,
+        startAmount: netAmount.toString(),
+        endAmount: netAmount.toString(),
+      };
+    });
+
+    const counter = await publicClient.readContract({
+      address: SEAPORT_ADDRESS as Address,
+      abi: SEAPORT_ABI,
+      functionName: "getCounter",
+      args: [seller],
+    }) as bigint;
+    const salt = BigInt(keccak256(
+      encodeAbiParameters(
+        parseAbiParameters("address, uint256, uint256"),
+        [seller, BigInt(Math.floor(Date.now() / 1000)), BigInt(Math.floor(Math.random() * 1e18))],
+      ),
+    ));
+
+    const mirrorComponents: SeaportOrderComponents = {
+      offerer: seller,
+      zone: "0x0000000000000000000000000000000000000000",
+      offer: mirrorOffer,
+      consideration: mirrorConsideration,
+      orderType: OrderType.FULL_OPEN,
+      startTime: oobOrder.orderJson.startTime,
+      endTime: oobOrder.orderJson.endTime,
+      zoneHash: "0x0000000000000000000000000000000000000000000000000000000000000000",
+      salt: salt.toString(),
+      conduitKey: "0x0000000000000000000000000000000000000000000000000000000000000000",
+      counter: counter.toString(),
+    };
+
+    const signature = await this.signOrder(mirrorComponents, walletClient);
+    const value = mirrorConsideration.reduce(
+      (sum, item) => sum + (Number(item.itemType) === ItemType.NATIVE ? BigInt(item.endAmount) : 0n),
+      0n,
+    );
+
+    return {
+      mirrorOrder: {
+        parameters: this.buildOrderParameters(mirrorComponents),
+        numerator: 1n,
+        denominator: 1n,
+        signature,
+        extraData: "0x" as Hex,
+      },
+      value,
+    };
+  }
+
+  private buildAcceptOfferFulfillments(order: SeaportOrderComponents) {
+    const fulfillments = [
+      {
+        offerComponents: [{ orderIndex: 1n, itemIndex: 0n }],
+        considerationComponents: [{ orderIndex: 0n, itemIndex: 0n }],
+      },
+      {
+        offerComponents: [{ orderIndex: 0n, itemIndex: 0n }],
+        considerationComponents: [{ orderIndex: 1n, itemIndex: 0n }],
+      },
+    ];
+
+    for (let i = 1; i < order.consideration.length; i += 1) {
+      fulfillments.push({
+        offerComponents: [{ orderIndex: 0n, itemIndex: 0n }],
+        considerationComponents: [{ orderIndex: 0n, itemIndex: BigInt(i) }],
+      });
+    }
+
+    return fulfillments;
   }
 }

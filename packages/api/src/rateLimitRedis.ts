@@ -8,8 +8,9 @@
  * - Built-in expiration handling
  */
 
-import type { Env } from "./types.js";
+import type { Env, RequestApiAccess } from "./types.js";
 import { jsonError } from "./response.js";
+import { getEntitlementNumber, resolveRequestApiAccess } from "./subscriptions.js";
 
 interface RateLimitResult {
   allowed: boolean;
@@ -182,29 +183,19 @@ export async function checkRateLimitRedis(
   request: Request,
   env: Env,
   isWrite: boolean,
+  access?: RequestApiAccess,
 ): Promise<Response | null> {
   // Fallback to KV if Redis not configured
   if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) {
     const { checkRateLimit } = await import("./rateLimit.js");
-    return checkRateLimit(request, env, isWrite);
+    return checkRateLimit(request, env, isWrite, access);
   }
 
   try {
     const rateLimit = new RedisRateLimit(env);
-    
-    const apiKey = request.headers.get("X-API-Key");
-    const isRegistered = apiKey ? isValidApiKey(apiKey, env) : false;
-
-    // Hash API key before use as Redis identifier so the raw secret never
-    // appears in Redis keyspace, Upstash REST URLs, or infrastructure logs.
-    const rawIdentifier = (apiKey && isRegistered) ? apiKey : getClientIp(request);
-    if (!rawIdentifier) return null; // Can't identify client
-    const identifier = (apiKey && isRegistered)
-      ? `k:${await hashIdentifier(apiKey)}`
-      : `ip:${rawIdentifier}`;
-
-    // Determine limit based on tier and request type
-    const limit = getLimit(env, isRegistered, isWrite);
+    const resolvedAccess = access ?? await resolveRequestApiAccess(request, env);
+    const identifier = await hashIdentifier(resolvedAccess.identifier);
+    const limit = getLimit(env, resolvedAccess.isRegistered, isWrite, resolvedAccess.entitlements);
     const windowSeconds = 60; // 1 minute window
 
     const result = await rateLimit.checkRateLimit(identifier, limit, windowSeconds, isWrite);
@@ -233,25 +224,19 @@ export async function addRateLimitHeadersRedis(
   request: Request,
   env: Env,
   isWrite: boolean,
+  access?: RequestApiAccess,
 ): Promise<Response> {
   // Fallback to KV if Redis not configured
   if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) {
     const { addRateLimitHeaders } = await import("./rateLimit.js");
-    return addRateLimitHeaders(response, request, env, isWrite);
+    return addRateLimitHeaders(response, request, env, isWrite, access);
   }
 
   try {
     const rateLimit = new RedisRateLimit(env);
-    
-    const apiKey = request.headers.get("X-API-Key");
-    const isRegistered = apiKey ? isValidApiKey(apiKey, env) : false;
-    const rawIdentifier = (apiKey && isRegistered) ? apiKey : getClientIp(request);
-    if (!rawIdentifier) return response;
-    const identifier = (apiKey && isRegistered)
-      ? `k:${await hashIdentifier(apiKey)}`
-      : `ip:${rawIdentifier}`;
-
-    const limit = getLimit(env, isRegistered, isWrite);
+    const resolvedAccess = access ?? await resolveRequestApiAccess(request, env);
+    const identifier = await hashIdentifier(resolvedAccess.identifier);
+    const limit = getLimit(env, resolvedAccess.isRegistered, isWrite, resolvedAccess.entitlements);
     const windowSeconds = 60;
 
     // Get current usage (without incrementing)
@@ -303,7 +288,11 @@ async function hashIdentifier(value: string): Promise<string> {
     .join("");
 }
 
-function getLimit(env: Env, isRegistered: boolean, isWrite: boolean): number {
+function getLimit(env: Env, isRegistered: boolean, isWrite: boolean, entitlements?: Record<string, unknown>): number {
+  const entitlementLimit = isWrite
+    ? getEntitlementNumber(entitlements, "writeRpm", 0)
+    : getEntitlementNumber(entitlements, "readRpm", 0);
+  if (entitlementLimit > 0) return entitlementLimit;
   if (isRegistered) {
     return isWrite
       ? Number(env.RATE_LIMIT_REGISTERED_WRITES || 60)
@@ -312,18 +301,4 @@ function getLimit(env: Env, isRegistered: boolean, isWrite: boolean): number {
   return isWrite
     ? Number(env.RATE_LIMIT_PUBLIC_WRITES || 10)
     : Number(env.RATE_LIMIT_PUBLIC_READS || 60);
-}
-
-function isValidApiKey(key: string, env: Env): boolean {
-  if (!env.API_KEYS) return false;
-  const validKeys = env.API_KEYS.split(",").map((k) => k.trim()).filter(Boolean);
-  return validKeys.includes(key);
-}
-
-function getClientIp(request: Request): string {
-  return (
-    request.headers.get("CF-Connecting-IP") ||
-    request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ||
-    "unknown"
-  );
 }

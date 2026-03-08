@@ -29,6 +29,28 @@ function nativeItem(amount: string, recipient: string) {
   };
 }
 
+function erc721CollectionConsiderationItem() {
+  return {
+    itemType: 4,
+    token: NFT,
+    identifierOrCriteria: "0",
+    startAmount: "1",
+    endAmount: "1",
+    recipient: OFFERER,
+  };
+}
+
+function erc721CriteriaConsiderationItem(root: string) {
+  return {
+    itemType: 4,
+    token: NFT,
+    identifierOrCriteria: root,
+    startAmount: "1",
+    endAmount: "1",
+    recipient: OFFERER,
+  };
+}
+
 function erc20Item(amount: string, recipient: string) {
   return {
     itemType: 1,
@@ -46,6 +68,46 @@ function listingOrder(extraConsideration: any[] = [], sellerAmount = "9967") {
     consideration: [
       nativeItem(sellerAmount, OFFERER),
       nativeItem("33", PROTOCOL),
+      ...extraConsideration,
+    ],
+    orderType: 0,
+  };
+}
+
+function collectionOfferOrder(extraConsideration: any[] = []) {
+  return {
+    offer: [
+      {
+        itemType: 1,
+        token: ERC20,
+        identifierOrCriteria: "0",
+        startAmount: "10000",
+        endAmount: "10000",
+      },
+    ],
+    consideration: [
+      erc721CollectionConsiderationItem(),
+      erc20Item("33", PROTOCOL),
+      ...extraConsideration,
+    ],
+    orderType: 0,
+  };
+}
+
+function criteriaOfferOrder(root: string, extraConsideration: any[] = []) {
+  return {
+    offer: [
+      {
+        itemType: 1,
+        token: ERC20,
+        identifierOrCriteria: "0",
+        startAmount: "10000",
+        endAmount: "10000",
+      },
+    ],
+    consideration: [
+      erc721CriteriaConsiderationItem(root),
+      erc20Item("33", PROTOCOL),
       ...extraConsideration,
     ],
     orderType: 0,
@@ -91,12 +153,12 @@ describe("fee parsing", () => {
       listingOrder([nativeItem("100", ORIGIN)], "9867"),
       OFFERER.toLowerCase(),
       PROTOCOL,
-      { originFeeRecipient: ORIGIN, originFeeBps: 100 },
+      { originFees: [{ recipient: ORIGIN, bps: 100 }] },
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
-    expect(result.parsed.originFeeRecipient).toBe(ORIGIN.toLowerCase());
+    expect(result.parsed.originFees).toEqual([{ recipient: ORIGIN.toLowerCase(), bps: 100 }]);
     expect(result.parsed.originFeeBps).toBe(100);
     expect(result.parsed.royaltyBps).toBe(0);
   });
@@ -119,7 +181,7 @@ describe("fee parsing", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
-    expect(result.parsed.originFeeRecipient).toBe("");
+    expect(result.parsed.originFees).toEqual([]);
     expect(result.parsed.originFeeBps).toBe(0);
     expect(result.parsed.royaltyRecipient).toBe(ROYALTY.toLowerCase());
     expect(result.parsed.royaltyBps).toBe(500);
@@ -130,11 +192,16 @@ describe("fee parsing", () => {
       listingOrder([nativeItem("100", ORIGIN), nativeItem("500", ROYALTY)], "9367"),
       OFFERER.toLowerCase(),
       PROTOCOL,
+      {
+        originFees: [{ recipient: ORIGIN, bps: 100 }],
+        royaltyRecipient: ROYALTY,
+        royaltyBps: 500,
+      },
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
-    expect(result.parsed.originFeeRecipient).toBe(ORIGIN.toLowerCase());
+    expect(result.parsed.originFees).toEqual([{ recipient: ORIGIN.toLowerCase(), bps: 100 }]);
     expect(result.parsed.originFeeBps).toBe(100);
     expect(result.parsed.royaltyRecipient).toBe(ROYALTY.toLowerCase());
     expect(result.parsed.royaltyBps).toBe(500);
@@ -153,17 +220,40 @@ describe("fee parsing", () => {
     expect(result.parsed.royaltyBps).toBe(0);
   });
 
+  it("parses collection offer scope correctly", () => {
+    const result = parseOrderDetails(collectionOfferOrder(), OFFERER.toLowerCase(), PROTOCOL);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(result.parsed.orderType).toBe("offer");
+    expect(result.parsed.assetScope).toBe("collection");
+    expect(result.parsed.tokenId).toBe("0");
+    expect(result.parsed.identifierOrCriteria).toBe("0");
+  });
+
+  it("parses criteria offer scope correctly", () => {
+    const root = "123456789";
+    const result = parseOrderDetails(criteriaOfferOrder(root), OFFERER.toLowerCase(), PROTOCOL);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(result.parsed.orderType).toBe("offer");
+    expect(result.parsed.assetScope).toBe("criteria");
+    expect(result.parsed.tokenId).toBe("0");
+    expect(result.parsed.identifierOrCriteria).toBe(root);
+  });
+
   it("parses offer with protocol plus origin fee", () => {
     const result = parseOrderDetails(
       offerOrder([erc20Item("100", ORIGIN)]),
       OFFERER.toLowerCase(),
       PROTOCOL,
-      { originFeeRecipient: ORIGIN, originFeeBps: 100 },
+      { originFees: [{ recipient: ORIGIN, bps: 100 }] },
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
-    expect(result.parsed.originFeeRecipient).toBe(ORIGIN.toLowerCase());
+    expect(result.parsed.originFees).toEqual([{ recipient: ORIGIN.toLowerCase(), bps: 100 }]);
     expect(result.parsed.originFeeBps).toBe(100);
     expect(result.parsed.royaltyBps).toBe(0);
   });
@@ -189,7 +279,7 @@ describe("fee parsing", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
 
-    expect(result.error).toContain("more than two non-protocol fee recipients");
+    expect(result.error).toContain("unclassified extra fee recipients");
   });
 
   it("uses submission metadata to classify a single extra offer recipient as royalty", () => {
@@ -202,7 +292,7 @@ describe("fee parsing", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
-    expect(result.parsed.originFeeRecipient).toBe("");
+    expect(result.parsed.originFees).toEqual([]);
     expect(result.parsed.originFeeBps).toBe(0);
     expect(result.parsed.royaltyRecipient).toBe(ROYALTY.toLowerCase());
     expect(result.parsed.royaltyBps).toBe(500);
@@ -213,11 +303,16 @@ describe("fee parsing", () => {
       offerOrder([erc20Item("100", ORIGIN), erc20Item("500", ROYALTY)]),
       OFFERER.toLowerCase(),
       PROTOCOL,
+      {
+        originFees: [{ recipient: ORIGIN, bps: 100 }],
+        royaltyRecipient: ROYALTY,
+        royaltyBps: 500,
+      },
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
-    expect(result.parsed.originFeeRecipient).toBe(ORIGIN.toLowerCase());
+    expect(result.parsed.originFees).toEqual([{ recipient: ORIGIN.toLowerCase(), bps: 100 }]);
     expect(result.parsed.originFeeBps).toBe(100);
     expect(result.parsed.royaltyRecipient).toBe(ROYALTY.toLowerCase());
     expect(result.parsed.royaltyBps).toBe(500);

@@ -16,7 +16,14 @@ RATE_LIMIT_REGISTERED_WRITES = "60"
 
 # Secrets (set via wrangler secret put):
 # - DATABASE_URL (Neon Postgres connection string)
+# - POOL_DATABASE_URL (optional Neon pooled connection string for request traffic)
 # - API_ADMIN_TOKEN (for admin endpoints, optional)
+# - SESSION_SECRET (required for auth/subscription dashboard routes)
+# - SUBSCRIPTION_TREASURY_ADDRESS
+# - SUBSCRIPTION_PAYMENT_TOKEN_ADDRESS
+# - SUBSCRIPTION_PAYMENT_CHAIN_ID
+# - SUBSCRIPTION_MIN_CONFIRMATIONS
+# - RPC_URL_BASE (required for onchain subscription payment verification on Base)
 
 # KV for rate limiting counters
 # Create with: wrangler kv:namespace create "OOB_RATE_LIMIT"

@@ -2,7 +2,9 @@
 
 **A permissionless, public order book for NFT trading.** Built on [Seaport v1.6](https://github.com/ProjectOpenSea/seaport).
 
-Any marketplace, bot, AI agent, or individual can read orders, submit orders, and fill orders — no API key required for reads, no registration needed.
+Any marketplace, bot, AI agent, or individual can read orders, submit orders, and fill orders. Public reads do not require an API key, while higher-throughput access can use project API keys.
+
+If you are new to the project, start with [../../docs/start-here.md](../../docs/start-here.md). This document is specifically for SDK usage and SDK API surface.
 
 > **Think of it as a shared liquidity layer for NFTs.** Instead of every marketplace having its own isolated order book, the Open Order Book lets everyone share the same pool of buy and sell orders.
 
@@ -66,7 +68,7 @@ curl "https://api.openorderbook.xyz/v1/orders/best-listing?chainId=8453&collecti
 curl "https://api.openorderbook.xyz/v1/collections/0xYourNft/stats?chainId=8453"
 ```
 
-No SDK needed. No API key. Just HTTP.
+No SDK needed for public reads — just HTTP. Higher-throughput access can supply an API key.
 
 ## Creating Orders (Selling / Offering)
 
@@ -91,14 +93,34 @@ const listing = await oob.createListing({
 });
 console.log('Listed! Order hash:', listing.orderHash);
 
-// Make an offer on an NFT
-const offer = await oob.createOffer({
+// Make an open offer on a specific token
+const openOffer = await oob.createOffer({
   collection: '0xYourNftContract',
   tokenId: '42',
   amountWei: '500000000000000000', // 0.5 WETH
   currency: '0x4200000000000000000000000000000000000006', // WETH on Base
 });
+
+// Make a collection-wide open offer
+const collectionOffer = await oob.createOffer({
+  collection: '0xYourNftContract',
+  amountWei: '300000000000000000',
+  currency: '0x4200000000000000000000000000000000000006',
+});
+
+// Make a targeted offer when the seller is already known
+const targetedOffer = await oob.createTargetedOffer({
+  collection: '0xYourNftContract',
+  tokenId: '42',
+  seller: '0xSellerWalletAddress',
+  amountWei: '500000000000000000', // 0.5 WETH
+  currency: '0x4200000000000000000000000000000000000006', // WETH on Base
+});
 ```
+
+Use `createOffer()` for buyer-signed open offers that will later be accepted via Seaport's match flow.
+
+Use `createTargetedOffer()` only when the seller is already known and the offer can be accepted via the direct fulfill path.
 
 ## Buying / Filling Orders
 
@@ -106,9 +128,24 @@ const offer = await oob.createOffer({
 // Buy an NFT (sends on-chain transaction)
 const txHash = await oob.fillOrder(listing.orderHash);
 
+// Accept an open offer as the seller (mirror + match flow)
+const acceptTxHash = await oob.acceptOpenOffer(openOffer.orderHash, {
+  tokenId: '42',
+});
+
+// Accept a criteria-based offer as the seller (supply tokenId + Merkle proof)
+const acceptCriteriaTxHash = await oob.acceptOpenOffer(collectionOffer.orderHash, {
+  tokenId: '42',
+  criteriaProof: ['0x...'],
+});
+
 // Cancel your listing (on-chain transaction + API notification)
 const { txHash: cancelTx } = await oob.cancelOrder(listing.orderHash);
 ```
+
+`fillOrder()` is for listings and direct targeted offers.
+
+`acceptOpenOffer()` is for open offers created with `createOffer()`.
 
 ## For Marketplaces: Add Your Own Fee
 
@@ -133,6 +170,8 @@ The buyer pays: **item price + your marketplace fee (as tip)**.
 The OOB protocol fee is embedded in the signed order. Your buyer-side tip is optional app-layer behavior in MVP and can be bypassed by direct fills outside your marketplace flow.
 
 ## For Bots & AI Agents
+
+Public access is enough for lightweight usage. For higher sustained throughput, batch-heavy workflows, or plan-gated websocket usage, configure the SDK with a project API key.
 
 ### Real-time monitoring via WebSocket
 
@@ -177,9 +216,10 @@ Python, Rust, Go — any language that can make HTTP requests and sign EIP-712 m
 
 | Document | Audience | Description |
 |---|---|---|
-| [API Reference](./docs/api-reference.md) | Developers, bots | Every endpoint, parameter, and response format |
-| [Integration Guide](./docs/integration-guide.md) | Marketplaces, traders, bots | Step-by-step walkthroughs for common use cases |
-| [Architecture](./docs/architecture.md) | Contributors, self-hosters | How it works under the hood, infrastructure, self-hosting |
+| [Start Here](../../docs/start-here.md) | Everyone | Canonical entry point for choosing the right documentation path |
+| [API Reference](../../docs/api-reference.md) | Developers, bots | Every endpoint, parameter, and response format |
+| [Integration Guide](../../docs/integration-guide.md) | Marketplaces, traders, bots | Step-by-step walkthroughs for common use cases |
+| [Architecture](../../docs/architecture.md) | Contributors, self-hosters | How it works under the hood, infrastructure, and self-hosting |
 
 ## SDK Reference
 
@@ -228,8 +268,10 @@ For collection offers, marketplaces must decide royalty explicitly if they want 
 |---|---|---|
 | `connect(walletClient, publicClient)` | `this` | Connect wallet for signing |
 | `createListing(params)` | `{ orderHash, status }` | Sign and submit a listing |
-| `createOffer(params)` | `{ orderHash, status }` | Sign and submit an offer |
-| `fillOrder(hash, params?)` | `txHash` | Buy/accept an order on-chain |
+| `createOffer(params)` | `{ orderHash, status }` | Sign and submit an open offer |
+| `createTargetedOffer(params)` | `{ orderHash, status }` | Sign and submit a direct offer for a known seller |
+| `fillOrder(hash, params?)` | `txHash` | Buy a listing or accept a direct targeted offer |
+| `acceptOpenOffer(hash, params?)` | `txHash` | Accept an open offer via mirror + match flow |
 | `cancelOrder(hash)` | `{ txHash, apiStatus }` | Cancel on-chain + notify API |
 | `submitOrder(order, signature, params?)` | `{ orderHash, status }` | Submit a pre-signed order with optional fee/royalty metadata |
 

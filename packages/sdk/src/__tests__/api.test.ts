@@ -187,8 +187,7 @@ describe("ApiClient", () => {
 
       await api.submitOrder(order, "0xsig", {
         metadata: {
-          originFeeRecipient: "0x2222222222222222222222222222222222222222",
-          originFeeBps: 100,
+          originFees: [{ recipient: "0x2222222222222222222222222222222222222222", bps: 100 }],
           royaltyRecipient: "0x3333333333333333333333333333333333333333",
           royaltyBps: 500,
         },
@@ -196,8 +195,7 @@ describe("ApiClient", () => {
 
       const body = JSON.parse(mockFetch.mock.calls[0][1].body);
       expect(body.metadata).toEqual({
-        originFeeRecipient: "0x2222222222222222222222222222222222222222",
-        originFeeBps: 100,
+        originFees: [{ recipient: "0x2222222222222222222222222222222222222222", bps: 100 }],
         royaltyRecipient: "0x3333333333333333333333333333333333333333",
         royaltyBps: 500,
       });

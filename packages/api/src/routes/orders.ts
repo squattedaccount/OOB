@@ -8,9 +8,10 @@ import { getPooledSqlClient } from "../db.js";
 import { jsonResponse, jsonError } from "../response.js";
 import { computeOrderHash } from "../seaportHash.js";
 import { logActivity } from "../activity.js";
+import { RedisCache, CacheKeys, getCacheConfig, hashQueryParams } from "../cache.js";
 import { resolveCurrency, formatPriceDecimal } from "../currency.js";
 import { parseOrderDetails, validateFeeEnforcement } from "../fees.js";
-import { RedisCache, CacheKeys, getCacheConfig, hashQueryParams } from "../cache.js";
+import { getEntitlementNumber, resolveRequestApiAccess } from "../subscriptions.js";
 import {
   recoverTypedDataAddress,
   recoverMessageAddress,
@@ -28,17 +29,32 @@ const VALID_CHAINS = new Set([1, 8453, 84532, 999, 2020, 202601, 2741]);
 const MAX_BODY_SIZE = 64 * 1024; // 64 KB
 const MAX_ACTIVE_ORDERS_PER_OFFERER = 500;
 const MAX_ORIGIN_FEE_BPS = 500;
+const MAX_PUBLIC_BATCH_SIZE = 5;
 
 function isValidAddress(addr: string): boolean {
   return ETH_ADDRESS_RE.test(addr);
 }
 
-function isValidChainId(raw: unknown): raw is number {
-  const n = Number(raw);
+function isValidChainId(chainId: string | number): boolean {
+  const n = Number(chainId);
   return Number.isFinite(n) && VALID_CHAINS.has(n);
 }
 
 const MAX_BATCH_SIZE = 20;
+
+async function getAllowedBatchSize(request: Request, env: Env): Promise<number> {
+  const access = await resolveRequestApiAccess(request, env);
+  const entitlementBatchSize = getEntitlementNumber(access.entitlements, "maxBatchSize", 0);
+  if (entitlementBatchSize > 0) return entitlementBatchSize;
+  return access.isRegistered ? MAX_BATCH_SIZE : MAX_PUBLIC_BATCH_SIZE;
+}
+
+async function getAllowedBatchSizeForContext(ctx: RouteContext): Promise<number> {
+  const access = ctx.access ?? await resolveRequestApiAccess(ctx.request, ctx.env);
+  const entitlementBatchSize = getEntitlementNumber(access.entitlements, "maxBatchSize", 0);
+  if (entitlementBatchSize > 0) return entitlementBatchSize;
+  return access.isRegistered ? MAX_BATCH_SIZE : MAX_PUBLIC_BATCH_SIZE;
+}
 
 // ─── Seaport EIP-712 Signature Verification ─────────────────────────────────
 
@@ -133,6 +149,8 @@ const CONSIDERATION_ITEM_TUPLE = {
 const ORDER_PARAMETERS_TUPLE = {
   type: "tuple" as const,
   components: [
+    { name: "offerer", type: "address" as const },
+    { name: "zone", type: "address" as const },
     { name: "offer", type: "tuple[]" as const, components: OFFER_ITEM_TUPLE.components },
     { name: "consideration", type: "tuple[]" as const, components: CONSIDERATION_ITEM_TUPLE.components },
     { name: "orderType", type: "uint8" as const },
@@ -220,7 +238,7 @@ const ERC20_APPROVE_ABI = [
  * Broadcast an order event to WebSocket clients via the OrderStreamDO.
  * Fire-and-forget: errors are logged but never block the response.
  */
-async function broadcastOrderEvent(
+export async function broadcastOrderEvent(
   env: import("../types.js").Env,
   eventType: string,
   order: { orderHash: string; chainId: number; nftContract: string; [k: string]: unknown },
@@ -295,6 +313,8 @@ function mapRowToOrder(row: any) {
     offerer: row.offerer,
     nftContract: row.nft_contract,
     tokenId: row.token_id,
+    assetScope: row.asset_scope || "token",
+    identifierOrCriteria: row.identifier_or_criteria || row.token_id,
     tokenStandard: row.token_standard,
     priceWei: row.price_wei,
     currency: row.currency,
@@ -303,7 +323,7 @@ function mapRowToOrder(row: any) {
     priceDecimal: formatPriceDecimal(row.price_wei, cm.currencyDecimals),
     protocolFeeRecipient: row.protocol_fee_recipient,
     protocolFeeBps: row.protocol_fee_bps,
-    originFeeRecipient: row.origin_fee_recipient || null,
+    originFees: row.origin_fees_json || [],
     originFeeBps: row.origin_fee_bps || 0,
     royaltyRecipient: row.royalty_recipient || null,
     royaltyBps: row.royalty_bps || 0,
@@ -376,8 +396,16 @@ export async function handleGetOrders(ctx: RouteContext): Promise<Response> {
     queryParams.push(collection);
   }
   if (tokenId) {
-    conditions.push(`token_id = $${paramIdx++}`);
-    queryParams.push(tokenId);
+    if (safeType === "offer") {
+      conditions.push(`((asset_scope = 'token' AND token_id = $${paramIdx++}) OR asset_scope = 'collection')`);
+      queryParams.push(tokenId);
+    } else if (safeType === "listing") {
+      conditions.push(`token_id = $${paramIdx++}`);
+      queryParams.push(tokenId);
+    } else {
+      conditions.push(`((order_type = 'listing' AND token_id = $${paramIdx++}) OR (order_type = 'offer' AND ((asset_scope = 'token' AND token_id = $${paramIdx++}) OR asset_scope = 'collection')))`);
+      queryParams.push(tokenId, tokenId);
+    }
   } else if (tokenIds) {
     // ANY($N) with a text[] parameter — safe, no string interpolation of user data
     conditions.push(`token_id = ANY($${paramIdx++})`);
@@ -686,10 +714,13 @@ export async function handleBestOffer(ctx: RouteContext): Promise<Response> {
         SELECT * FROM seaport_orders
         WHERE chain_id = ${Number(chainId)}
           AND nft_contract = ${collection}
-          AND token_id = ${tokenId}
           AND order_type = 'offer'
           AND status = 'active'
           AND end_time > ${now}
+          AND (
+            (asset_scope = 'token' AND token_id = ${tokenId})
+            OR asset_scope = 'collection'
+          )
         ORDER BY CAST(price_wei AS NUMERIC) DESC
         LIMIT 1
       `;
@@ -795,12 +826,14 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
     orderType,
     nftContract,
     tokenId,
+    assetScope,
+    identifierOrCriteria,
     tokenStandard,
     priceWei,
     currency,
     protocolFeeRecipient,
     protocolFeeBps,
-    originFeeRecipient,
+    originFees,
     originFeeBps,
     royaltyRecipient,
     royaltyBps,
@@ -810,10 +843,12 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
   const orderHash = computeOrderHash(order, Number(chainId));
 
   const sql = getPooledSqlClient(ctx.env);
+  const cache = new RedisCache(ctx.env);
+  let reservedDedup = false;
 
   try {
     // Redis-based deduplication check (faster than DB)
-    const dedupResult = await new RedisCache(ctx.env).deduplicate(orderHash, 300).catch(() => "error" as const);
+    const dedupResult = await cache.deduplicate(orderHash, 300).catch(() => "error" as const);
 
     if (dedupResult === "duplicate") {
       return jsonResponse({ orderHash, status: "active", duplicate: true });
@@ -830,6 +865,7 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
       }
     }
     // dedupResult === "new" → proceed normally
+    reservedDedup = dedupResult === "new";
 
     // Prevent duplicate active listings for the same token by the same offerer
     if (orderType === "listing") {
@@ -844,6 +880,9 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
         LIMIT 1
       `;
       if (dupListing.length > 0) {
+        if (reservedDedup) {
+          await cache.clearDedup(orderHash).catch(() => {});
+        }
         return jsonError(409, "Active listing already exists for this token. Cancel the existing one first.");
       }
     }
@@ -858,6 +897,8 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
         orderType,
         nftContract,
         tokenId,
+        assetScope,
+        identifierOrCriteria,
         tokenStandard,
         priceWei: priceWei.toString(),
         currency,
@@ -867,16 +908,10 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
         endTime,
         protocolFeeRecipient,
         protocolFeeBps,
-        originFeeRecipient: originFeeRecipient || null,
+        originFees,
         originFeeBps,
         royaltyRecipient: royaltyRecipient || null,
         royaltyBps,
-      });
-
-      // Broadcast to WebSocket clients (fire-and-forget)
-      broadcastOrderEvent(ctx.env, orderType === "listing" ? "new_listing" : "new_offer", {
-        orderHash, chainId: Number(chainId), nftContract, tokenId, offerer,
-        priceWei: priceWei.toString(), currency, orderType,
       });
 
       return jsonResponse({ orderHash, status: "queued" }, 202);
@@ -886,10 +921,10 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
     const insertResult = await sql`
       INSERT INTO seaport_orders (
         order_hash, chain_id, order_type, offerer, zone,
-        nft_contract, token_id, token_standard,
+        nft_contract, token_id, asset_scope, identifier_or_criteria, token_standard,
         price_wei, currency,
         protocol_fee_recipient, protocol_fee_bps,
-        origin_fee_recipient, origin_fee_bps,
+        origin_fees_json, origin_fee_bps,
         royalty_recipient, royalty_bps,
         order_json, signature,
         start_time, end_time,
@@ -897,10 +932,10 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
       )
       SELECT
         ${orderHash}, ${Number(chainId)}, ${orderType}, ${offerer}, ${zone},
-        ${nftContract}, ${tokenId}, ${tokenStandard},
+        ${nftContract}, ${tokenId}, ${assetScope}, ${identifierOrCriteria}, ${tokenStandard},
         ${priceWei.toString()}, ${currency},
         ${protocolFeeRecipient}, ${protocolFeeBps},
-        ${originFeeRecipient || null}, ${originFeeBps},
+        ${JSON.stringify(originFees)}, ${originFeeBps},
         ${royaltyRecipient || null}, ${royaltyBps},
         ${JSON.stringify(order)}, ${signature},
         ${startTime}, ${endTime},
@@ -912,6 +947,9 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
       RETURNING order_hash
     `;
     if (!insertResult || insertResult.length === 0) {
+      if (reservedDedup) {
+        await cache.clearDedup(orderHash).catch(() => {});
+      }
       return jsonError(429, `Too many active orders for this offerer (max ${MAX_ACTIVE_ORDERS_PER_OFFERER})`);
     }
 
@@ -949,6 +987,9 @@ export async function handleSubmitOrder(ctx: RouteContext): Promise<Response> {
     return jsonResponse({ orderHash, status: "active" }, 201);
   } catch (err: any) {
     console.error("[oob-api] Failed to insert order:", err);
+    if (reservedDedup) {
+      await cache.clearDedup(orderHash).catch(() => {});
+    }
     return jsonError(500, "Failed to store order");
   }
 }
@@ -1300,7 +1341,8 @@ interface BatchSubmitResult {
 }
 
 export async function handleBatchSubmitOrders(ctx: RouteContext): Promise<Response> {
-  const maxBatchBody = MAX_BODY_SIZE * MAX_BATCH_SIZE;
+  const allowedBatchSize = await getAllowedBatchSizeForContext(ctx);
+  const maxBatchBody = MAX_BODY_SIZE * allowedBatchSize;
   let rawBody: string;
   try {
     rawBody = await readBodyWithLimit(ctx.request, maxBatchBody);
@@ -1320,8 +1362,8 @@ export async function handleBatchSubmitOrders(ctx: RouteContext): Promise<Respon
   if (!Array.isArray(orders) || orders.length === 0) {
     return jsonError(400, "Missing or empty 'orders' array");
   }
-  if (orders.length > MAX_BATCH_SIZE) {
-    return jsonError(400, `Batch size exceeds maximum (${MAX_BATCH_SIZE})`);
+  if (orders.length > allowedBatchSize) {
+    return jsonError(400, `Batch size exceeds maximum (${allowedBatchSize})`);
   }
 
   const sql = getPooledSqlClient(ctx.env);
@@ -1408,12 +1450,14 @@ async function processSingleOrderSubmit(
     orderType,
     nftContract,
     tokenId,
+    assetScope,
+    identifierOrCriteria,
     tokenStandard,
     priceWei,
     currency,
     protocolFeeRecipient,
     protocolFeeBps,
-    originFeeRecipient,
+    originFees,
     originFeeBps,
     royaltyRecipient,
     royaltyBps,
@@ -1454,20 +1498,20 @@ async function processSingleOrderSubmit(
   const insertResult = await sql`
     INSERT INTO seaport_orders (
       order_hash, chain_id, order_type, offerer, zone,
-      nft_contract, token_id, token_standard,
+      nft_contract, token_id, asset_scope, identifier_or_criteria, token_standard,
       price_wei, currency,
       protocol_fee_recipient, protocol_fee_bps,
-      origin_fee_recipient, origin_fee_bps,
+      origin_fees_json, origin_fee_bps,
       royalty_recipient, royalty_bps,
       order_json, signature,
       start_time, end_time, status
     )
     SELECT
       ${orderHash}, ${Number(chainId)}, ${orderType}, ${offerer}, ${zone},
-      ${nftContract}, ${tokenId}, ${tokenStandard},
+      ${nftContract}, ${tokenId}, ${assetScope}, ${identifierOrCriteria}, ${tokenStandard},
       ${priceWei.toString()}, ${currency},
       ${protocolFeeRecipient}, ${protocolFeeBps},
-      ${originFeeRecipient || null}, ${originFeeBps},
+      ${JSON.stringify(originFees)}, ${originFeeBps},
       ${royaltyRecipient || null}, ${royaltyBps},
       ${JSON.stringify(order)}, ${signature},
       ${startTime}, ${endTime}, 'active'
@@ -1906,9 +1950,10 @@ export async function handleFillTx(ctx: RouteContext): Promise<Response> {
 const MAX_BATCH_FILL_SIZE = 20;
 
 export async function handleBatchFillTx(ctx: RouteContext): Promise<Response> {
+  const allowedBatchSize = await getAllowedBatchSizeForContext(ctx);
   let body: any;
   try {
-    const raw = await readBodyWithLimit(ctx.request, MAX_BODY_SIZE * MAX_BATCH_FILL_SIZE);
+    const raw = await readBodyWithLimit(ctx.request, MAX_BODY_SIZE * allowedBatchSize);
     body = JSON.parse(raw);
   } catch (err: any) {
     if (err.message === "BODY_TOO_LARGE") return jsonError(413, "Request body too large");
@@ -1922,8 +1967,8 @@ export async function handleBatchFillTx(ctx: RouteContext): Promise<Response> {
   if (!Array.isArray(orderHashes) || orderHashes.length === 0) {
     return jsonError(400, "Missing or empty 'orderHashes' array");
   }
-  if (orderHashes.length > MAX_BATCH_FILL_SIZE) {
-    return jsonError(400, `Batch size exceeds maximum (${MAX_BATCH_FILL_SIZE})`);
+  if (orderHashes.length > allowedBatchSize) {
+    return jsonError(400, `Batch size exceeds maximum (${allowedBatchSize})`);
   }
   for (const h of orderHashes) {
     if (typeof h !== "string" || !ORDER_HASH_RE.test(h)) {
@@ -2366,6 +2411,7 @@ interface BatchCancelResult {
 }
 
 export async function handleBatchCancelOrders(ctx: RouteContext): Promise<Response> {
+  const allowedBatchSize = await getAllowedBatchSizeForContext(ctx);
   let body: any;
   try {
     const raw = await readBodyWithLimit(ctx.request, MAX_BODY_SIZE); // 64KB max
@@ -2379,8 +2425,8 @@ export async function handleBatchCancelOrders(ctx: RouteContext): Promise<Respon
   if (!Array.isArray(cancellations) || cancellations.length === 0) {
     return jsonError(400, "Missing or empty 'cancellations' array");
   }
-  if (cancellations.length > MAX_BATCH_SIZE) {
-    return jsonError(400, `Batch size exceeds maximum (${MAX_BATCH_SIZE})`);
+  if (cancellations.length > allowedBatchSize) {
+    return jsonError(400, `Batch size exceeds maximum (${allowedBatchSize})`);
   }
 
   const sql = getPooledSqlClient(ctx.env);

@@ -1,7 +1,5 @@
-import { neon, neonConfig } from "@neondatabase/serverless";
+import { neon } from "@neondatabase/serverless";
 import type { NeonQueryFunction } from "@neondatabase/serverless";
-
-neonConfig.fetchConnectionCache = true;
 
 export type SqlClient = NeonQueryFunction<false, false>;
 

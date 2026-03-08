@@ -16,7 +16,10 @@
 import type { Env, OrderIngestMessage } from "./types.js";
 import { getPooledSqlClient } from "./db.js";
 import { logActivity } from "./activity.js";
-import { RedisCache } from "./cache.js";
+import { RedisCache, CacheKeys } from "./cache.js";
+import { broadcastOrderEvent } from "./routes/orders.js";
+
+const MAX_ACTIVE_ORDERS_PER_OFFERER = 500;
 
 export async function handleOrderIngestQueue(
   batch: MessageBatch<OrderIngestMessage>,
@@ -55,8 +58,80 @@ export async function handleOrderIngestQueue(
 
   const toInsert = unique.filter((m) => !existingHashes.has(m.body.orderHash));
 
+  const cache = new RedisCache(env);
+
   if (toInsert.length === 0) {
     console.log("[oob-queue] All orders in batch are duplicates — skipping");
+    return;
+  }
+
+  const offerers = Array.from(new Set(toInsert.map((m) => m.body.offerer)));
+  const listingCandidates = toInsert.filter((m) => m.body.orderType === "listing");
+
+  let activeCounts = new Map<string, number>();
+  let activeListingKeys = new Set<string>();
+
+  try {
+    if (offerers.length > 0) {
+      const counts = await sql`
+        SELECT offerer, COUNT(*)::int AS active_count
+        FROM seaport_orders
+        WHERE offerer = ANY(${offerers})
+          AND status = 'active'
+        GROUP BY offerer
+      `;
+      activeCounts = new Map(counts.map((r: any) => [r.offerer, Number(r.active_count)]));
+    }
+
+    if (listingCandidates.length > 0) {
+      const existingListings = await sql`
+        SELECT offerer, chain_id, nft_contract, token_id
+        FROM seaport_orders
+        WHERE status = 'active'
+          AND order_type = 'listing'
+          AND offerer = ANY(${Array.from(new Set(listingCandidates.map((m) => m.body.offerer)))})
+      `;
+      activeListingKeys = new Set(
+        existingListings.map((r: any) => `${r.offerer}:${r.chain_id}:${r.nft_contract}:${r.token_id}`),
+      );
+    }
+  } catch (err) {
+    console.error("[oob-queue] Failed to load queue-side invariants:", err);
+    batch.retryAll();
+    return;
+  }
+
+  const accepted: typeof toInsert = [];
+  const rejected: typeof toInsert = [];
+  const batchListingKeys = new Set<string>();
+
+  for (const message of toInsert) {
+    const offerer = message.body.offerer;
+    const currentActive = activeCounts.get(offerer) ?? 0;
+    if (currentActive >= MAX_ACTIVE_ORDERS_PER_OFFERER) {
+      rejected.push(message);
+      continue;
+    }
+
+    if (message.body.orderType === "listing") {
+      const listingKey = `${message.body.offerer}:${message.body.chainId}:${message.body.nftContract}:${message.body.tokenId}`;
+      if (activeListingKeys.has(listingKey) || batchListingKeys.has(listingKey)) {
+        rejected.push(message);
+        continue;
+      }
+      batchListingKeys.add(listingKey);
+    }
+
+    accepted.push(message);
+    activeCounts.set(offerer, currentActive + 1);
+  }
+
+  if (rejected.length > 0) {
+    await Promise.allSettled(rejected.map((m) => cache.clearDedup(m.body.orderHash)));
+    console.warn(`[oob-queue] Dropped ${rejected.length} queued orders that failed authoritative invariants`);
+  }
+
+  if (accepted.length === 0) {
     return;
   }
 
@@ -67,43 +142,45 @@ export async function handleOrderIngestQueue(
     await sql`
       INSERT INTO seaport_orders (
         order_hash, chain_id, offerer, zone,
-        nft_contract, token_id, token_standard,
+        nft_contract, token_id, asset_scope, identifier_or_criteria, token_standard,
         order_type, price_wei, currency,
         protocol_fee_recipient, protocol_fee_bps,
-        origin_fee_recipient, origin_fee_bps,
+        origin_fees_json, origin_fee_bps,
         royalty_recipient, royalty_bps,
         order_json, signature,
         start_time, end_time,
         status
       )
       SELECT * FROM unnest(
-        ${toInsert.map((m) => m.body.orderHash)}::text[],
-        ${toInsert.map((m) => m.body.chainId)}::int[],
-        ${toInsert.map((m) => m.body.offerer)}::text[],
-        ${toInsert.map((m) => m.body.zone)}::text[],
-        ${toInsert.map((m) => m.body.nftContract)}::text[],
-        ${toInsert.map((m) => m.body.tokenId)}::text[],
-        ${toInsert.map((m) => m.body.tokenStandard)}::text[],
-        ${toInsert.map((m) => m.body.orderType)}::text[],
-        ${toInsert.map((m) => m.body.priceWei)}::text[],
-        ${toInsert.map((m) => m.body.currency)}::text[],
-        ${toInsert.map((m) => m.body.protocolFeeRecipient)}::text[],
-        ${toInsert.map((m) => m.body.protocolFeeBps)}::int[],
-        ${toInsert.map((m) => m.body.originFeeRecipient)}::text[],
-        ${toInsert.map((m) => m.body.originFeeBps)}::int[],
-        ${toInsert.map((m) => m.body.royaltyRecipient)}::text[],
-        ${toInsert.map((m) => m.body.royaltyBps)}::int[],
-        ${toInsert.map((m) => JSON.stringify(m.body.order))}::text[],
-        ${toInsert.map((m) => m.body.signature)}::text[],
-        ${toInsert.map((m) => m.body.startTime)}::int[],
-        ${toInsert.map((m) => m.body.endTime)}::int[],
+        ${accepted.map((m) => m.body.orderHash)}::text[],
+        ${accepted.map((m) => m.body.chainId)}::int[],
+        ${accepted.map((m) => m.body.offerer)}::text[],
+        ${accepted.map((m) => m.body.zone)}::text[],
+        ${accepted.map((m) => m.body.nftContract)}::text[],
+        ${accepted.map((m) => m.body.tokenId)}::text[],
+        ${accepted.map((m) => m.body.assetScope)}::text[],
+        ${accepted.map((m) => m.body.identifierOrCriteria)}::text[],
+        ${accepted.map((m) => m.body.tokenStandard)}::text[],
+        ${accepted.map((m) => m.body.orderType)}::text[],
+        ${accepted.map((m) => m.body.priceWei)}::text[],
+        ${accepted.map((m) => m.body.currency)}::text[],
+        ${accepted.map((m) => m.body.protocolFeeRecipient)}::text[],
+        ${accepted.map((m) => m.body.protocolFeeBps)}::int[],
+        ${accepted.map((m) => JSON.stringify(m.body.originFees))}::text[],
+        ${accepted.map((m) => m.body.originFeeBps)}::int[],
+        ${accepted.map((m) => m.body.royaltyRecipient)}::text[],
+        ${accepted.map((m) => m.body.royaltyBps)}::int[],
+        ${accepted.map((m) => JSON.stringify(m.body.order))}::text[],
+        ${accepted.map((m) => m.body.signature)}::text[],
+        ${accepted.map((m) => m.body.startTime)}::int[],
+        ${accepted.map((m) => m.body.endTime)}::int[],
         ${"active"}::text[]
       ) AS t(
         order_hash, chain_id, offerer, zone,
-        nft_contract, token_id, token_standard,
+        nft_contract, token_id, asset_scope, identifier_or_criteria, token_standard,
         order_type, price_wei, currency,
         protocol_fee_recipient, protocol_fee_bps,
-        origin_fee_recipient, origin_fee_bps,
+        origin_fees_json, origin_fee_bps,
         royalty_recipient, royalty_bps,
         order_json, signature,
         start_time, end_time,
@@ -112,7 +189,7 @@ export async function handleOrderIngestQueue(
       ON CONFLICT (order_hash) DO NOTHING
     `;
 
-    console.log(`[oob-queue] Inserted ${toInsert.length} orders`);
+    console.log(`[oob-queue] Inserted ${accepted.length} orders`);
   } catch (err) {
     console.error("[oob-queue] Bulk INSERT failed:", err);
     batch.retryAll();
@@ -120,7 +197,7 @@ export async function handleOrderIngestQueue(
   }
 
   // Log activity for each inserted order (best-effort, non-blocking)
-  const activityPromises = toInsert.map((m) =>
+  const activityPromises = accepted.map((m) =>
     logActivity(sql, {
       orderHash: m.body.orderHash,
       chainId: m.body.chainId,
@@ -134,19 +211,32 @@ export async function handleOrderIngestQueue(
   );
 
   // Invalidate Redis cache for affected collections (best-effort)
-  const cachePromises = toInsert.map(async (m) => {
+  const cachePromises = accepted.map(async (m) => {
     try {
-      const cache = new RedisCache(env);
       const chainIdStr = String(m.body.chainId);
       const nftContract = m.body.nftContract;
       await Promise.all([
-        cache.del(`oob:best-listing:${chainIdStr}:${nftContract}`),
-        cache.del(`oob:stats:${chainIdStr}:${nftContract}`),
+        cache.del(CacheKeys.allBestListings(chainIdStr, nftContract)),
+        cache.del(CacheKeys.allCollectionStats(chainIdStr, nftContract)),
+        cache.del(CacheKeys.allOrdersLists(chainIdStr, nftContract)),
       ]);
     } catch {
       // Non-fatal
     }
   });
 
-  await Promise.allSettled([...activityPromises, ...cachePromises]);
+  const broadcastPromises = accepted.map((m) =>
+    broadcastOrderEvent(env, m.body.orderType === "listing" ? "new_listing" : "new_offer", {
+      orderHash: m.body.orderHash,
+      chainId: m.body.chainId,
+      nftContract: m.body.nftContract,
+      tokenId: m.body.tokenId,
+      offerer: m.body.offerer,
+      priceWei: m.body.priceWei,
+      currency: m.body.currency,
+      orderType: m.body.orderType,
+    }).catch((err) => console.error("[oob-queue] broadcast failed:", err)),
+  );
+
+  await Promise.allSettled([...activityPromises, ...cachePromises, ...broadcastPromises]);
 }

@@ -36,6 +36,7 @@ export const SUPPORTED_CHAINS = {
   84532: { name: "Base Sepolia", nativeSymbol: "ETH" },
   999: { name: "Hyperliquid", nativeSymbol: "HYPE" },
   2020: { name: "Ronin", nativeSymbol: "RON" },
+  202601: { name: "Ronin Saigon", nativeSymbol: "STT" },
   2741: { name: "Abstract", nativeSymbol: "ETH" },
 } as const;
 
@@ -51,13 +52,14 @@ export interface OobOrder {
   offerer: string;
   nftContract: string;
   tokenId: string;
+  assetScope?: "token" | "collection" | "criteria";
+  identifierOrCriteria?: string;
   tokenStandard: "ERC721" | "ERC1155";
   priceWei: string;
   currency: string;
   protocolFeeRecipient: string;
   protocolFeeBps: number;
-  originFeeRecipient: string | null;
-  originFeeBps: number;
+  originFees: OriginFee[];
   royaltyRecipient: string | null;
   royaltyBps: number;
   startTime: number;
@@ -112,15 +114,18 @@ export interface OobConfig {
   apiUrl?: string;
   /** Optional API key for higher rate limits */
   apiKey?: string;
-  /** Optional origin fee in basis points for the marketplace/integrator creating the order. Defaults to 0. */
-  originFeeBps?: number;
-  /** Origin fee recipient address. Required if originFeeBps > 0. */
-  originFeeRecipient?: string;
+  /** Optional origin fee recipients for the marketplace/integrator creating the order. */
+  originFees?: OriginFee[];
   /** Royalty inclusion policy for SDK-created orders. Defaults to manual_only. */
   royaltyPolicy?: RoyaltyPolicyMode;
 }
 
 export type RoyaltyPolicyMode = "off" | "manual_only" | "auto_eip2981";
+
+export interface OriginFee {
+  recipient: string;
+  bps: number;
+}
 
 /**
  * Protocol fee config returned by GET /v1/config.
@@ -132,17 +137,16 @@ export interface ProtocolConfig {
 }
 
 export interface OrderSubmissionMetadata {
-  originFeeRecipient?: string;
-  originFeeBps?: number;
+  originFees?: OriginFee[];
   royaltyRecipient?: string;
   royaltyBps?: number;
 }
 
 export const DEFAULT_API_URL = "https://api.openorderbook.xyz";
-export const DEFAULT_ORIGIN_FEE_BPS = 0;
-export const DEFAULT_ORIGIN_FEE_RECIPIENT = "";
+export const DEFAULT_ORIGIN_FEES: OriginFee[] = [];
 export const DEFAULT_ROYALTY_POLICY: RoyaltyPolicyMode = "manual_only";
 export const MAX_ORIGIN_FEE_BPS = 500;
+export const MAX_ORIGIN_FEE_RECIPIENTS = 5;
 export const DEFAULT_LISTING_DURATION = 30 * 24 * 60 * 60; // 30 days
 export const DEFAULT_OFFER_DURATION = 7 * 24 * 60 * 60; // 7 days
 
@@ -208,12 +212,42 @@ export interface CreateOfferParams {
   quantity?: string | bigint;
 }
 
+export interface CreateTargetedOfferParams {
+  /** NFT contract address */
+  collection: string;
+  /** Token ID for the specific NFT being targeted. */
+  tokenId: string;
+  /** Seller address that will receive the net payout. */
+  seller: string;
+  /** Offer amount in wei (as string or bigint). */
+  amountWei: string | bigint;
+  /** ERC20 currency address (typically WETH). */
+  currency: string;
+  /** Duration in seconds. Defaults to 7 days. */
+  duration?: number;
+  /** Royalty basis points */
+  royaltyBps?: number;
+  /** Royalty recipient address */
+  royaltyRecipient?: string;
+  /** Token standard: "ERC721" or "ERC1155". Defaults to "ERC721". */
+  tokenStandard?: "ERC721" | "ERC1155";
+  /** Quantity for ERC1155 tokens. Defaults to 1. */
+  quantity?: string | bigint;
+}
+
 export interface FillOrderParams {
   /** Optional tip for the filling marketplace */
   tip?: {
     recipient: string;
     basisPoints: number;
   };
+}
+
+export interface AcceptOpenOfferParams {
+  /** Concrete token ID being supplied by the seller. Required for collection and criteria offers. */
+  tokenId?: string;
+  /** Criteria proof for criteria-based offers. */
+  criteriaProof?: string[];
 }
 
 // ─── API Response Shapes ────────────────────────────────────────────────────

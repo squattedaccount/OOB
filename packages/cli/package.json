@@ -1,0 +1,61 @@
+{
+  "name": "@oob/cli",
+  "version": "0.1.0",
+  "description": "Agent-first CLI for Open Order Book",
+  "type": "module",
+  "bin": {
+    "oob": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "check": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "oob",
+    "open-order-book",
+    "cli",
+    "agents",
+    "ai-agents",
+    "orderbook",
+    "seaport",
+    "nft"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/nodz-space/open-order-book/tree/main/packages/cli",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nodz-space/open-order-book.git",
+    "directory": "packages/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/nodz-space/open-order-book/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0"
+  }
+}

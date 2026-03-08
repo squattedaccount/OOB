@@ -2,7 +2,7 @@
 
 Base URL: `https://api.openorderbook.xyz`
 
-All read endpoints are public — no API key required. Write endpoints (POST, DELETE) are also open but subject to rate limits.
+All read endpoints are public — no API key required. Write endpoints (POST, DELETE) are also open but subject to rate limits. Higher-throughput access is available through DB-backed project API keys.
 
 ---
 
@@ -11,12 +11,19 @@ All read endpoints are public — no API key required. Write endpoints (POST, DE
 | Tier | How | Read Limit | Write Limit |
 |---|---|---|---|
 | **Public** | No header needed | 60 req/min | 10 req/min |
-| **Registered** | `X-API-Key: your-key` header | 300 req/min | 60 req/min |
-| **Premium** | `X-API-Key: your-key` header | 1000+ req/min | 200+ req/min |
+| **Legacy registered** | `X-API-Key: your-key` header | 300 req/min | 60 req/min |
+| **Project key** | `X-API-Key: your-key` header | Plan entitlement | Plan entitlement |
 
-Rate limits are per IP (public) or per API key (registered/premium). When exceeded, the API returns `429 Too Many Requests`.
+Rate limits are per IP (public) or per API key/project key. When exceeded, the API returns `429 Too Many Requests`.
 
-API keys are free to request. Premium keys are available for high-volume integrators.
+Project API keys are created through the authenticated subscription/dashboard flow and resolve to project entitlements stored in Postgres. Legacy `API_KEYS` remain supported as a migration fallback, but do not include DB-backed subscription state.
+
+### Subscription-backed access
+
+- **Wallet auth** uses a bearer session token issued by the subscription/auth routes.
+- **Projects** own one or more API keys.
+- **Plans / entitlements** control per-minute limits, batch size, websocket access, and monthly request quota.
+- **Monthly quotas** are enforced only for DB-backed project access; public and legacy API key traffic remain on the legacy rate-limit model.
 
 ---
 
@@ -493,6 +500,8 @@ Build ERC20 `approve` calldata for Seaport spending.
 
 Real-time order events via WebSocket connection.
 
+For public clients, websocket access is available subject to standard rate limiting. For DB-backed project keys, websocket upgrades are additionally gated by project plan entitlements and monthly quota state.
+
 **Connection:**
 
 ```
@@ -506,6 +515,17 @@ wss://api.openorderbook.xyz/v1/stream?chainId=8453&collection=0xnft&events=new_l
 | `chainId` | number | **yes** | Chain ID |
 | `collection` | string | no | Filter by collection (omit for all) |
 | `events` | string | no | Comma-separated event types to subscribe to |
+
+**Authentication:**
+
+- no header required for public access
+- `X-API-Key` may be supplied for project or legacy registered access
+- DB-backed project keys must have `websocketEnabled = true` in their active plan to connect successfully
+
+**Possible errors:**
+
+- `429` if request rate limit or monthly project quota is exceeded
+- `403` if the resolved DB-backed project plan does not permit websocket access
 
 **Event types:**
 
