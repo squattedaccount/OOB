@@ -23,6 +23,7 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "check": "tsc --noEmit",
+    "test": "npm run build && node --test test/e2e.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "publishConfig": {
@@ -39,14 +40,13 @@
     "nft"
   ],
   "license": "MIT",
-  "homepage": "https://github.com/nodz-space/open-order-book/tree/main/packages/cli",
+  "homepage": "https://github.com/nodz-space/oob-cli",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nodz-space/open-order-book.git",
-    "directory": "packages/cli"
+    "url": "git+https://github.com/nodz-space/oob-cli.git"
   },
   "bugs": {
-    "url": "https://github.com/nodz-space/open-order-book/issues"
+    "url": "https://github.com/nodz-space/oob-cli/issues"
   },
   "engines": {
     "node": ">=18"

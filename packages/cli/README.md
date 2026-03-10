@@ -67,6 +67,9 @@ Supported environment variables:
 - `OOB_API_KEY`
 - `OOB_ENV`
 - `OOB_OUTPUT`
+- `OOB_TIMEOUT_MS`
+- `OOB_RETRIES`
+- `OOB_RETRY_DELAY_MS`
 
 Example:
 
@@ -124,6 +127,12 @@ If you want to extract one field for an agent:
 
 ```bash
 npx @oob/cli --field data.apiUrl --raw config show
+```
+
+If you want bounded and retryable network behavior for automation:
+
+```bash
+npx @oob/cli --timeout 8000 --retries 2 --retry-delay 500 health
 ```
 
 ## Exit codes and errors
@@ -273,13 +282,14 @@ If needed, pass `OOB_API_KEY` via environment variable.
 
 ```bash
 npm install
-npm run build --workspace=packages/sdk
-npm run build --workspace=packages/cli
-node packages/cli/dist/cli.js health
+npm run check
+npm run build
+node dist/cli.js health
 ```
 
 ## Publish
 
 ```bash
-npm publish --workspace=packages/cli
+npm pack
+npm publish
 ```

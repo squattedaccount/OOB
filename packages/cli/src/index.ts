@@ -1,17 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { Command } from "commander";
+import { CliError, type CliErrorCode, classifyError } from "./errors.js";
+import { getJson } from "./network.js";
 
 export type OutputFormat = "json" | "jsonl" | "text";
-
-type CliErrorCode =
-  | "API_ERROR"
-  | "AUTH_ERROR"
-  | "BATCH_INPUT_ERROR"
-  | "INVALID_INPUT"
-  | "NETWORK_ERROR"
-  | "NOT_FOUND"
-  | "INTERNAL_ERROR";
 
 interface CommandOptions {
   apiKey?: unknown;
@@ -24,7 +17,10 @@ interface CommandOptions {
   jsonl?: unknown;
   output?: unknown;
   raw?: unknown;
+  retries?: unknown;
+  retryDelay?: unknown;
   text?: unknown;
+  timeout?: unknown;
   watch?: unknown;
 }
 
@@ -88,42 +84,18 @@ interface ConfigDoctorData {
 class CliApiClient {
   constructor(private readonly config: RuntimeConfig) {}
 
-  private headers(): Record<string, string> {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-
-    if (this.config.apiKey) {
-      headers["X-API-Key"] = this.config.apiKey;
-    }
-
-    return headers;
-  }
-
   private baseUrl(): string {
     return this.config.apiUrl.replace(/\/$/, "");
   }
 
   private async get<T>(path: string): Promise<T> {
-    const response = await fetch(`${this.baseUrl()}${path}`, {
-      method: "GET",
-      headers: this.headers(),
-    });
-
-    if (!response.ok) {
-      let message = `API error ${response.status}`;
-      try {
-        const body = await response.json() as { error?: string };
-        if (body.error) {
-          message = body.error;
-        }
-      } catch {
-        // no-op
-      }
-      throw new OobApiError(response.status, message);
-    }
-
-    return response.json() as Promise<T>;
+    return getJson<T>({
+      apiKey: this.config.apiKey,
+      apiUrl: this.baseUrl(),
+      retries: this.config.retries,
+      retryDelayMs: this.config.retryDelayMs,
+      timeoutMs: this.config.timeoutMs,
+    }, path);
   }
 
   async getProtocolConfig(): Promise<ProtocolConfigResponse> {
@@ -256,28 +228,6 @@ interface GetBestOrderParams {
   tokenId?: string;
 }
 
-class OobApiError extends Error {
-  constructor(
-    public readonly status: number,
-    message: string,
-  ) {
-    super(message);
-    this.name = "OobApiError";
-  }
-}
-
-class CliError extends Error {
-  constructor(
-    public readonly code: CliErrorCode,
-    public readonly exitCode: number,
-    message: string,
-    public readonly status?: number,
-  ) {
-    super(message);
-    this.name = "CliError";
-  }
-}
-
 export interface RuntimeConfig {
   apiKey?: string;
   apiUrl: string;
@@ -287,6 +237,9 @@ export interface RuntimeConfig {
   intervalMs: number;
   output: OutputFormat;
   raw: boolean;
+  retries: number;
+  retryDelayMs: number;
+  timeoutMs: number;
   watch: boolean;
 }
 
@@ -295,6 +248,9 @@ const DEFAULT_CHAIN_ID = 8453;
 const DEFAULT_ENV = "production";
 const DEFAULT_OUTPUT: OutputFormat = "json";
 const DEFAULT_INTERVAL_MS = 10_000;
+const DEFAULT_TIMEOUT_MS = 8_000;
+const DEFAULT_RETRIES = 1;
+const DEFAULT_RETRY_DELAY_MS = 500;
 const pendingActionPromises = new Set<Promise<unknown>>();
 
 type ActionHandler = (this: Command, ...args: any[]) => void | Promise<void>;
@@ -345,6 +301,9 @@ function normalizeArgvForLegacyCommander(argv: string[]): string[] {
     "--output",
     "--field",
     "--interval",
+    "--timeout",
+    "--retries",
+    "--retry-delay",
   ]);
 
   let commandIndex = 2;
@@ -409,6 +368,22 @@ function parseInterval(value: string): number {
     throw new CliError("INVALID_INPUT", 3, `Invalid interval: expected a positive number of seconds, received ${value}`);
   }
   return Math.round(parsed * 1000);
+}
+
+function parsePositiveInteger(value: string, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0) {
+    throw new CliError("INVALID_INPUT", 3, `Invalid ${label}: expected a non-negative integer, received ${value}`);
+  }
+  return parsed;
+}
+
+function parseTimeout(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new CliError("INVALID_INPUT", 3, `Invalid timeout: expected a positive number of milliseconds, received ${value}`);
+  }
+  return Math.round(parsed);
 }
 
 function parseOutput(value: string): OutputFormat {
@@ -518,6 +493,9 @@ function buildSuccessPayload(commandName: string, config: RuntimeConfig, data: u
     meta: {
       apiUrl: config.apiUrl,
       chainId: config.chainId,
+      retries: config.retries,
+      retryDelayMs: config.retryDelayMs,
+      timeoutMs: config.timeoutMs,
       env: config.env,
       field: config.field ?? null,
       output: config.output,
@@ -560,28 +538,6 @@ function renderSuccess(commandName: string, config: RuntimeConfig, data: unknown
   }
 
   textWrite(textLines ?? [JSON.stringify(data, null, 2)]);
-}
-
-function classifyError(error: unknown): CliError {
-  if (error instanceof CliError) {
-    return error;
-  }
-  if (error instanceof OobApiError) {
-    if (error.status === 401 || error.status === 403) {
-      return new CliError("AUTH_ERROR", 4, error.message, error.status);
-    }
-    if (error.status === 404) {
-      return new CliError("NOT_FOUND", 2, error.message, error.status);
-    }
-    return new CliError("API_ERROR", 5, error.message, error.status);
-  }
-  if (error instanceof TypeError && error.message.toLowerCase().includes("fetch failed")) {
-    return new CliError("NETWORK_ERROR", 5, error.message);
-  }
-  if (error instanceof Error) {
-    return new CliError("INTERNAL_ERROR", 1, error.message);
-  }
-  return new CliError("INTERNAL_ERROR", 1, "Unknown error");
 }
 
 async function readInputFile(path: string): Promise<string> {
@@ -840,6 +796,9 @@ async function executeBatchRequest(client: CliApiClient, request: BatchRequest):
 function resolveConfig(command: Command): RuntimeConfig {
   const options = getCommandOptions(command);
   const chainIdRaw = coerceString(options.chainId) ?? getEnv("OOB_CHAIN_ID");
+  const retriesRaw = coerceString(options.retries) ?? getEnv("OOB_RETRIES");
+  const retryDelayRaw = coerceString(options.retryDelay) ?? getEnv("OOB_RETRY_DELAY_MS");
+  const timeoutRaw = coerceString(options.timeout) ?? getEnv("OOB_TIMEOUT_MS");
   const explicitJson = coerceBoolean(options.json);
   const explicitJsonl = coerceBoolean(options.jsonl);
   const explicitText = coerceBoolean(options.text);
@@ -847,9 +806,9 @@ function resolveConfig(command: Command): RuntimeConfig {
     ? "json"
     : explicitJsonl
       ? "jsonl"
-    : explicitText
-      ? "text"
-      : coerceString(options.output) ?? getEnv("OOB_OUTPUT");
+      : explicitText
+        ? "text"
+        : coerceString(options.output) ?? getEnv("OOB_OUTPUT");
   const intervalRaw = coerceString(options.interval);
 
   return {
@@ -861,6 +820,9 @@ function resolveConfig(command: Command): RuntimeConfig {
     intervalMs: intervalRaw ? parseInterval(intervalRaw) : DEFAULT_INTERVAL_MS,
     output: outputRaw ? parseOutput(outputRaw) : DEFAULT_OUTPUT,
     raw: coerceBoolean(options.raw),
+    retries: retriesRaw ? parsePositiveInteger(retriesRaw, "retries") : DEFAULT_RETRIES,
+    retryDelayMs: retryDelayRaw ? parsePositiveInteger(retryDelayRaw, "retryDelay") : DEFAULT_RETRY_DELAY_MS,
+    timeoutMs: timeoutRaw ? parseTimeout(timeoutRaw) : DEFAULT_TIMEOUT_MS,
     watch: coerceBoolean(options.watch),
   };
 }
@@ -1115,6 +1077,9 @@ function emitError(commandName: string, config: RuntimeConfig | undefined, error
             field: config.field ?? null,
             output: config.output,
             raw: config.raw,
+            retries: config.retries,
+            retryDelayMs: config.retryDelayMs,
+            timeoutMs: config.timeoutMs,
             watch: config.watch,
           }
         : undefined,
@@ -1166,6 +1131,9 @@ function addGlobalOptions(program: Command): Command {
     .option("--raw", "Print the selected value without JSON wrapper formatting")
     .option("--watch", "Repeat the command on an interval until interrupted")
     .option("--interval <seconds>", "Polling interval in seconds when --watch is enabled")
+    .option("--timeout <milliseconds>", "Abort network requests after the given timeout in milliseconds")
+    .option("--retries <count>", "Retry retryable network/API failures this many times")
+    .option("--retry-delay <milliseconds>", "Base delay between retries in milliseconds")
     .option("--json", "Force JSON output")
     .option("--jsonl", "Force JSONL output")
     .option("--text", "Force text output");
