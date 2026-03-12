@@ -52,7 +52,11 @@
     "node": ">=18"
   },
   "dependencies": {
-    "commander": "^12.1.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@oob/sdk": "*",
+    "commander": "^12.1.0",
+    "viem": "^2.21.0",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "tsup": "^8.0.0",

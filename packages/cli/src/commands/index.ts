@@ -1,0 +1,16 @@
+export { registerActivityCommands } from "./activity.js";
+export { registerAgentCommands } from "./agent.js";
+export { registerAnalyzeCommands } from "./analyze.js";
+export { registerApproveCommands } from "./approve.js";
+export { registerBatchCommands } from "./batch.js";
+export { registerCollectionsCommands } from "./collections.js";
+export { registerCompletionsCommands } from "./completions.js";
+export { registerConfigCommands } from "./config.js";
+export { registerDescribeCommands } from "./describe.js";
+export { registerMarketCommands } from "./market.js";
+export { registerOrdersCommands } from "./orders.js";
+export { registerWriteOrderCommands } from "./orders-write.js";
+export { registerSetupCommands } from "./setup.js";
+export { registerStreamCommands } from "./stream.js";
+export { registerWalletCommands } from "./wallet.js";
+export { registerWatchCommands } from "./watch.js";

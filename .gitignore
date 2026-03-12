@@ -7,3 +7,5 @@ wrangler.toml
 .DS_Store
 .env
 .env.local
+seaport-main/
+opensea-cli-main/
